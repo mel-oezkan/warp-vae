@@ -6,10 +6,7 @@ bottleneck.
 First, you should pre-compute the bounding boxes since this takes a long time.
 
 Usage:
-    python -m preprocess.preprocess_co3d --category all --precompute_bbox \
-        --co3d_v2_dir /path/to/co3d_v2
-    python -m preprocess.preprocess_co3d --category all \
-        --co3d_v2_dir /path/to/co3d_v2
+    python preprocess_co3d.py --category all --precompute_bbox --co3d_v2_dir ../data/co3d_data
 """
 
 import argparse

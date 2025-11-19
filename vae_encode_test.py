@@ -15,7 +15,7 @@ import os
 #dataset dir
 #ROOT_DIR=os.path.join(os.getcwd(),"data","co3d_data")
 ROOT_DIR="../data/co3d_data"
-
+BBOX_DIR="../data/co3d_v2_annotations"
 
 
 # read config
@@ -48,6 +48,8 @@ vae.load_state_dict(vae_state_dict,strict=False)
 vae.eval().to(device)
 
 bench_dataset=CO3D_Dataset(root_dir=ROOT_DIR,
+                           bbox_dir=BBOX_DIR,
+                           
                            category="cake",
                            subset_name="dev_0",
                            transform=transform
