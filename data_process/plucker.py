@@ -67,7 +67,6 @@ def create_grid(
     W,
     device,
     patch_num=16, #if None, no patch
-<<<<<<< HEAD
    ):
     """Helper function to create the Image Coodinate grid. 
 
@@ -81,12 +80,6 @@ def create_grid(
     Returns:
         _type_: _description_
     """
-=======
-
-
-
-   ):
->>>>>>> 052334331bdd61ee8b7662490a94633930fb6c02
     grids=[]
     if patch_num is not None:
 
@@ -120,16 +113,9 @@ def create_grid(
         return pixel_grid #(H,W,3)
 
 
-<<<<<<< HEAD
 def plucker_from_all_pixels(R , T , pixel_grid, fl, pp ):
     """ Function to compute the Plücker coordinates given the full image.
 
-=======
-
-
-def plucker_from_all_pixels(R , T , pixel_grid, fl, pp ):
-    """
->>>>>>> 052334331bdd61ee8b7662490a94633930fb6c02
     R: (3,3)
     T: (3,)
     fl: (2,)
@@ -145,36 +131,20 @@ def plucker_from_all_pixels(R , T , pixel_grid, fl, pp ):
     u=u.reshape(N)
     v=v.reshape(N)
 
-<<<<<<< HEAD
-=======
-
-
->>>>>>> 052334331bdd61ee8b7662490a94633930fb6c02
     #convert pixel into camera cooridnate
     cx,cy=pp[0],pp[1]
     fx,fy=fl[0],fl[1]
 
-<<<<<<< HEAD
     # normalize pixel coordinates [0, 1] -> [-1, 1]
-=======
->>>>>>> 052334331bdd61ee8b7662490a94633930fb6c02
     x=(u-cx) / fx #(N)
     y=(v-cy) / fy
 
     z=torch.ones_like(x)
 
-<<<<<<< HEAD
     dir_cam = torch.stack([x,y,z],dim=-1) #(N,3)
     #dir_cam= torch.nn.functional.normalize(dir_cam,dim=-1)
 
     dir_world= dir_cam @ R #(N,3)
-=======
-    dir_cam= torch.stack([x,y,z],dim=-1) #(N,3)
-    #dir_cam= torch.nn.functional.normalize(dir_cam,dim=-1)
-
-    dir_world= dir_cam @ R #(N,3)
-
->>>>>>> 052334331bdd61ee8b7662490a94633930fb6c02
     C_world= -T @ R.T #(3)
 
     m_world= torch.cross(C_world.expand_as(dir_world), dir_world,dim=-1) #(N,3)
@@ -182,26 +152,14 @@ def plucker_from_all_pixels(R , T , pixel_grid, fl, pp ):
     return torch.cat([dir_world,m_world],dim=-1) #(N,6)
 
 
-<<<<<<< HEAD
 def plucker_from_single_pixels(R, T, fl, pp,u,v ):
-=======
-def plucker_from_single_pixels(R , T ,  fl, pp,u,v ):
->>>>>>> 052334331bdd61ee8b7662490a94633930fb6c02
     """
     R: (3,3)
     T: (3,)
     fl: (2,)
     pp: (2,)
-<<<<<<< HEAD
     u, v: constant
     """
-=======
-    u ,v: constant
-    """
-
-
-
->>>>>>> 052334331bdd61ee8b7662490a94633930fb6c02
     #convert pixel into camera cooridnate
     cx,cy=pp[0],pp[1]
     fx,fy=fl[0],fl[1]
