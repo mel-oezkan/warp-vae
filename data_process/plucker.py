@@ -1,9 +1,6 @@
 from torchvision.transforms.functional import crop
 import torch
-<<<<<<< HEAD
 
-=======
->>>>>>> 052334331bdd61ee8b7662490a94633930fb6c02
 def update_intrinsics_after_crop(
     focal_length,
     principle_point,
@@ -17,7 +14,6 @@ def update_intrinsics_after_crop(
     crop_params: [-cc[0], -cc[1], crop_width, s]
     original_image_size: tuple(orig_h, orig_w)
     cropped_image_size: tuple(cropped_h, cropped_w) final resized cropped window
-
     """
     orig_h, orig_w=original_image_size[0],original_image_size[1]
 
