@@ -9,3 +9,5 @@ __pycache__/*
 .python-version
 latent_batches/
 pyproject.toml
+taming-transformers/*
+taming-transformers
