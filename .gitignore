@@ -11,3 +11,5 @@ latent_batches/
 pyproject.toml
 taming-transformers/*
 taming-transformers
+model_storage/
+output/
