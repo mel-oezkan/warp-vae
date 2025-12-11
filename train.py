@@ -429,9 +429,18 @@ class FinetuneVAE(pl.LightningModule):
     def forward(self, x):
         return self.model(x)
 
+    
     def training_step(self, batch, batch_idx):
-        target, _ = batch
-        if batch_idx % 50 == 0:  # Print every 50 batches
+        # Handle both dataset formats
+        if isinstance(batch, dict):
+            # CO3D dataset format
+            target = batch["image"]
+            label = None
+        else:
+            # FinetuneFaceData format
+            target, label = batch
+            
+        if batch_idx % 50 == 0:
             print(f"[DEBUG] Training step - Epoch: {self.current_epoch}, Batch: {batch_idx}, Target shape: {target.shape}")
         
         if self.precision == 16:
@@ -440,55 +449,72 @@ class FinetuneVAE(pl.LightningModule):
         posterior = self.model.encode(target)
         z = posterior.sample()
         pred = self.model.decode(z)
-        # kl_loss = posterior.kl()
-        # kl_loss = kl_loss.mean()
 
         rec_loss = torch.abs(target.contiguous() - pred.contiguous())
         if self.current_epoch < self.trainer.max_epochs // 3 * 2:
             rec_loss = rec_loss.mean() * rec_loss.size(1)
         else:
-            rec_loss = rec_loss.pow(2).mean() * rec_loss.size(1)  #
+            rec_loss = rec_loss.pow(2).mean() * rec_loss.size(1)
 
         with torch.no_grad():
             lpips_loss = self.lpips_loss_fn(pred, target).mean()
 
-        loss = (
-            rec_loss + self.lpips_loss_weight * lpips_loss
-        )  # + self.kl_weight * kl_loss
+        loss = rec_loss + self.lpips_loss_weight * lpips_loss
+        
         if batch_idx % 50 == 0:
             print(f"[DEBUG] Training losses - Rec: {rec_loss:.4f}, LPIPS: {lpips_loss:.4f}, Total: {loss:.4f}")
         
-        self.log(
-            "rec_loss",
-            rec_loss,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "lpips_loss",
-            lpips_loss,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=True,
-            logger=True,
-        )
-        self.log(
-            "total_loss",
-            loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            logger=True,
-        )
+        self.log("rec_loss", rec_loss, on_step=True, on_epoch=False, prog_bar=True, logger=True)
+        self.log("lpips_loss", lpips_loss, on_step=True, on_epoch=False, prog_bar=True, logger=True)
+        self.log("total_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         
-        # Log learning rate
         if batch_idx % 100 == 0:
             current_lr = self.optimizers().param_groups[0]['lr']
             self.log("learning_rate", current_lr, on_step=True, logger=True)
         
         return loss
+
+    def validation_step(self, batch, batch_idx):
+        # Handle both dataset formats
+        if isinstance(batch, dict):
+            # CO3D dataset format
+            target = batch["image"]
+            name = torch.arange(target.shape[0])  # Use indices as labels
+        else:
+            # FinetuneFaceData format
+            target, name = batch
+            
+        if batch_idx == 0:
+            print(f"[DEBUG] Validation step - Epoch: {self.current_epoch}, Batch: {batch_idx}, Target shape: {target.shape}")
+        
+        if self.precision == 16:
+            target = target.half()
+
+        posterior = self.model.encode(target)
+        z = posterior.mode()
+        pred = self.model.decode(z)
+
+        rec_loss = torch.abs(target.contiguous() - pred.contiguous())
+        rec_loss = rec_loss.mean()
+
+        lpips_loss = self.lpips_loss_fn(pred, target).mean()
+        loss = rec_loss + self.lpips_loss_weight * lpips_loss
+        
+        if batch_idx == 0:
+            print(f"[DEBUG] Validation losses - Rec: {rec_loss:.4f}, LPIPS: {lpips_loss:.4f}, Total: {loss:.4f}")
+
+        output = {"val_loss": loss.detach(), "rec_loss": rec_loss.detach(), "lpips_loss": lpips_loss.detach()}
+        
+        if batch_idx == 0 and self.use_wandb:
+            self.log_images_wandb(target, pred, name)
+        
+        self.validation_step_outputs.append(output)
+        
+        del pred, name, target
+        torch.cuda.empty_cache()
+
+        return output
+
 
     def configure_optimizers(self):
         if self.optim == "sgd":
@@ -502,47 +528,7 @@ class FinetuneVAE(pl.LightningModule):
             raise NotImplementedError
         return optimizer
 
-    def validation_step(self, batch, batch_idx):
-        target, name = batch
-        if batch_idx == 0:
-            print(f"[DEBUG] Validation step - Epoch: {self.current_epoch}, Batch: {batch_idx}, Target shape: {target.shape}")
-        
-        if self.precision == 16:
-            target = target.half()
-
-        posterior = self.model.encode(target)
-        z = posterior.mode()
-        pred = self.model.decode(z)
-
-        #! removing KL loss for finetuning
-        # kl_loss = posterior.kl()
-        # kl_loss = kl_loss.mean() # torch.sum(kl_loss) / kl_loss.shape[0]
-
-        rec_loss = torch.abs(target.contiguous() - pred.contiguous())
-        rec_loss = rec_loss.mean()  # torch.sum(rec_loss) / (rec_loss.shape[0] *  rec_loss.shape[2] * rec_loss.shape[3])
-
-        lpips_loss = self.lpips_loss_fn(pred, target).mean()
-        loss = (
-            rec_loss + self.lpips_loss_weight * lpips_loss
-        )  # + self.kl_weight * kl_loss
-        # self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        # self.log_images(target, pred, name)
-        if batch_idx == 0:
-            print(f"[DEBUG] Validation losses - Rec: {rec_loss:.4f}, LPIPS: {lpips_loss:.4f}, Total: {loss:.4f}")
-
-        output = {"val_loss": loss.detach(), "rec_loss": rec_loss.detach(), "lpips_loss": lpips_loss.detach()}
-        
-        # Log sample images to wandb on first batch
-        if batch_idx == 0 and self.use_wandb:
-            self.log_images_wandb(target, pred, name)
-        
-        self.validation_step_outputs.append(output)
-        
-        del pred, name, target
-        torch.cuda.empty_cache()
-
-        return output
-
+    
     def log_images(self, input, output, names):
         if self.log_one_batch:
             return
@@ -698,6 +684,7 @@ def get_device_config():
 
 @hydra.main(version_base=None, config_path="config", config_name="finetuneVAE")
 def main(cfg: DictConfig):
+    
     print(f"[DEBUG] Starting training with config: {OmegaConf.to_yaml(cfg)}")
     
     # Initialize wandb
@@ -732,6 +719,7 @@ def main(cfg: DictConfig):
     else:
         print("[DEBUG] Wandb logging disabled")
     
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_gpus, devices, strategy = get_device_config()
     print(f"[DEBUG] Using device: {device}, GPUs: {n_gpus}, Strategy: {strategy}")
@@ -749,12 +737,28 @@ def main(cfg: DictConfig):
     vae_weight = get_vae_weights(input_path)
     print(f"[DEBUG] Loaded VAE weights from {input_path}, found {len(vae_weight)} parameters")
 
-    data_module = DataModule(
-        cfg.data.data_dir, 
-        batch_size=cfg.training.batch_size, 
-        val_size=cfg.training.val_size, 
-        size=cfg.training.image_size
-    )
+    # Select dataset based on config
+    dataset_type = cfg.data.get('dataset_type', 'face')
+    print(f"[DEBUG] Using dataset type: {dataset_type}")
+    
+    if dataset_type == 'co3d':
+        data_module = Co3DDataModule(
+            co3d_dir=cfg.data.co3d_dir,
+            bb_file=cfg.data.bb_file,
+            batch_size=cfg.training.batch_size,
+            val_size=cfg.training.val_size,
+            size=cfg.training.image_size,
+            apply_augmentation=cfg.data.get('apply_augmentation', False),
+            crop_images=cfg.data.get('crop_images', False),
+            patch_num=cfg.data.get('patch_num', None),
+        )
+    else:
+        data_module = DataModule(
+            cfg.data.data_dir, 
+            batch_size=cfg.training.batch_size, 
+            val_size=cfg.training.val_size, 
+            size=cfg.training.image_size
+        )
 
     model = FinetuneVAE(
         vae_config=vae_config,
