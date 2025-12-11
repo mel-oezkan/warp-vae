@@ -13,3 +13,12 @@ taming-transformers/*
 taming-transformers
 model_storage/
 output/
+.gitmodules/
+sd21_vae_local/
+.venv/
+wandb/
+__pycache__*
+*__pycache__
+config/
+.log
+outputs/
