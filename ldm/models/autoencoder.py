@@ -10,19 +10,25 @@ from ldm.util import instantiate_from_config
 from ldm.modules.ema import LitEma
 
 
+
 class AutoencoderKL(pl.LightningModule):
-    def __init__(self,
-                 ddconfig,
-                 lossconfig,
-                 embed_dim,
-                 ckpt_path=None,
-                 ignore_keys=[],
-                 image_key="image",
-                 colorize_nlabels=None,
-                 monitor=None,
-                 ema_decay=None,
-                 learn_logvar=False
-                 ):
+    def __init__(
+        self,
+        ddconfig,
+        lossconfig,
+        embed_dim,
+        n_patches: int,
+        plucker_key: str,
+        ckpt_path=None,
+        ignore_keys=[],
+        image_key="image",
+        colorize_nlabels=None,
+        monitor=None,
+        ema_decay=None,
+        learn_logvar=False,
+        plucker_hidden_dim=512,  # Larger hidden dimension
+        plucker_dropout=0.1,  # Dropout rate
+    ):
         super().__init__()
         self.learn_logvar = learn_logvar
         self.image_key = image_key
@@ -30,11 +36,38 @@ class AutoencoderKL(pl.LightningModule):
         self.decoder = Decoder(**ddconfig)
         self.loss = instantiate_from_config(lossconfig)
         assert ddconfig["double_z"]
-        self.quant_conv = torch.nn.Conv2d(2*ddconfig["z_channels"], 2*embed_dim, 1)
+        self.quant_conv = torch.nn.Conv2d(2 * ddconfig["z_channels"], 2 * embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
         self.embed_dim = embed_dim
+        self.n_patches = n_patches
+        self.plucker_key = plucker_key
+
+        # map from h to plücker coords
+        # Encoder output has 2*z_channels due to double_z=True
+        encoder_out_channels = 2 * ddconfig["z_channels"]
+        self.pluck_head = torch.nn.Conv2d(encoder_out_channels, 6, kernel_size=1)
+        self.act = torch.nn.SiLU()
+
+        # Build Plücker MLP using template
+        self.pluck_norm_in = torch.nn.LayerNorm(6)
+        self.pluck_proj_layers = torch.nn.ModuleList(
+            [
+                self._make_projection_layer(6, plucker_hidden_dim, plucker_dropout),
+                self._make_projection_layer(
+                    plucker_hidden_dim, plucker_hidden_dim, plucker_dropout
+                ),
+            ]
+        )
+        self.pluck_proj_out = torch.nn.Linear(plucker_hidden_dim, 6)
+
+        # Initialize with small weights for stability
+        for module in self.pluck_proj_layers.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight, gain=0.01)
+        torch.nn.init.xavier_uniform_(self.pluck_proj_out.weight, gain=0.01)
+
         if colorize_nlabels is not None:
-            assert type(colorize_nlabels)==int
+            assert type(colorize_nlabels) == int
             self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
         if monitor is not None:
             self.monitor = monitor
@@ -42,12 +75,31 @@ class AutoencoderKL(pl.LightningModule):
         self.use_ema = ema_decay is not None
         if self.use_ema:
             self.ema_decay = ema_decay
-            assert 0. < ema_decay < 1.
+            assert 0.0 < ema_decay < 1.0
             self.model_ema = LitEma(self, decay=ema_decay)
             print(f"Keeping EMAs of {len(list(self.model_ema.buffers()))}.")
 
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+    def _make_projection_layer(self, in_dim, out_dim, dropout_rate):
+        """
+        Template for creating a projection layer with normalization and dropout.
+
+        Args:
+            in_dim: Input dimension
+            out_dim: Output dimension
+            dropout_rate: Dropout probability
+
+        Returns:
+            nn.Sequential module containing Linear -> LayerNorm -> SiLU -> Dropout
+        """
+        return torch.nn.Sequential(
+            torch.nn.Linear(in_dim, out_dim),
+            torch.nn.LayerNorm(out_dim),
+            torch.nn.SiLU(),
+            torch.nn.Dropout(dropout_rate),
+        )
 
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
@@ -80,10 +132,49 @@ class AutoencoderKL(pl.LightningModule):
             self.model_ema(self)
 
     def encode(self, x):
+        """
+        Encode input image to VAE latent and Plücker coordinates.
+
+        Args:
+            x: Input image tensor (B, C, H, W)
+
+        Returns:
+            posterior: DiagonalGaussianDistribution for VAE latent
+            pluck: Plücker coordinates (B, n_patches*n_patches, 6)
+        """
+        B = x.shape[0]  # Get batch size from input
         h = self.encoder(x)
+
+        # Generate initial Plücker coordinates from encoder output
+        pluck = self.pluck_head(h)  # (B, 6, H, W)
+        pluck = self.act(pluck)
+
+        # Interpolate to n_patches × n_patches spatial size
+        pluck = F.interpolate(
+            pluck,
+            size=(self.n_patches, self.n_patches),
+            mode="bilinear",
+            align_corners=False,
+        )  # (B, 6, n_patches, n_patches)
+
+        # Reshape to (B, n_patches*n_patches, 6) for MLP processing
+        pluck = pluck.permute(0, 2, 3, 1).reshape(B, -1, 6).contiguous()
+
+        # Apply MLP with normalization and dropout
+        pluck = self.pluck_norm_in(pluck)
+
+        # Apply projection layers sequentially
+        for layer in self.pluck_proj_layers:
+            pluck = layer(pluck)
+
+        # Final projection to 6D Plücker space
+        pluck = self.pluck_proj_out(pluck)  # (B, n_patches*n_patches, 6)
+
+        # Generate VAE latent posterior
         moments = self.quant_conv(h)
         posterior = DiagonalGaussianDistribution(moments)
-        return posterior
+
+        return posterior, pluck
 
     def decode(self, z):
         z = self.post_quant_conv(z)
@@ -91,13 +182,13 @@ class AutoencoderKL(pl.LightningModule):
         return dec
 
     def forward(self, input, sample_posterior=True):
-        posterior = self.encode(input)
+        posterior, pluck = self.encode(input)
         if sample_posterior:
             z = posterior.sample()
         else:
             z = posterior.mode()
         dec = self.decode(z)
-        return dec, posterior
+        return dec, posterior, pluck
 
     def get_input(self, batch, k):
         x = batch[k]
@@ -108,23 +199,71 @@ class AutoencoderKL(pl.LightningModule):
 
     def training_step(self, batch, batch_idx, optimizer_idx):
         inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self(inputs)
+        gt_plucker = batch[self.plucker_key]
+
+        reconstructions, posterior, pred_ray = self(inputs)
 
         if optimizer_idx == 0:
             # train encoder+decoder+logvar
-            aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
-                                            last_layer=self.get_last_layer(), split="train")
-            self.log("aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            return aeloss
+            aeloss, log_dict_ae = self.loss(
+                inputs,
+                reconstructions,
+                posterior,
+                optimizer_idx,
+                self.global_step,
+                last_layer=self.get_last_layer(),
+                split="train",
+            )
+
+            # Compute Plücker loss
+            plucker_loss = self.hybrid_plucker_loss(pred_ray, gt_plucker.detach())
+
+            total_loss = aeloss + plucker_loss
+
+            self.log(
+                "aeloss",
+                aeloss,
+                prog_bar=True,
+                logger=True,
+                on_step=True,
+                on_epoch=True,
+            )
+            self.log(
+                "plucker_loss",
+                plucker_loss,
+                prog_bar=True,
+                logger=True,
+                on_step=True,
+                on_epoch=True,
+            )
+            self.log_dict(
+                log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False
+            )
+            return total_loss
 
         if optimizer_idx == 1:
             # train the discriminator
-            discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
-                                                last_layer=self.get_last_layer(), split="train")
+            discloss, log_dict_disc = self.loss(
+                inputs,
+                reconstructions,
+                posterior,
+                optimizer_idx,
+                self.global_step,
+                last_layer=self.get_last_layer(),
+                split="train",
+            )
 
-            self.log("discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+            self.log(
+                "discloss",
+                discloss,
+                prog_bar=True,
+                logger=True,
+                on_step=True,
+                on_epoch=True,
+            )
+            self.log_dict(
+                log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False
+            )
             return discloss
 
     def validation_step(self, batch, batch_idx):
@@ -135,29 +274,51 @@ class AutoencoderKL(pl.LightningModule):
 
     def _validation_step(self, batch, batch_idx, postfix=""):
         inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self(inputs)
-        aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, 0, self.global_step,
-                                        last_layer=self.get_last_layer(), split="val"+postfix)
+        gt_plucker = batch[self.plucker_key]
+        reconstructions, posterior, pred_plucker = self(inputs)
+        aeloss, log_dict_ae = self.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            0,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="val" + postfix,
+        )
 
-        discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, 1, self.global_step,
-                                            last_layer=self.get_last_layer(), split="val"+postfix)
+        discloss, log_dict_disc = self.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            1,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="val" + postfix,
+        )
+
+        plucker_loss = self.hybrid_plucker_loss(pred_plucker, gt_plucker)
 
         self.log(f"val{postfix}/rec_loss", log_dict_ae[f"val{postfix}/rec_loss"])
+        self.log(f"val{postfix}/plucker_loss", plucker_loss)
         self.log_dict(log_dict_ae)
         self.log_dict(log_dict_disc)
         return self.log_dict
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        ae_params_list = list(self.encoder.parameters()) + list(self.decoder.parameters()) + list(
-            self.quant_conv.parameters()) + list(self.post_quant_conv.parameters())
+        ae_params_list = (
+            list(self.encoder.parameters())
+            + list(self.decoder.parameters())
+            + list(self.quant_conv.parameters())
+            + list(self.post_quant_conv.parameters())
+        )
         if self.learn_logvar:
             print(f"{self.__class__.__name__}: Learning logvar")
             ae_params_list.append(self.loss.logvar)
-        opt_ae = torch.optim.Adam(ae_params_list,
-                                  lr=lr, betas=(0.5, 0.9))
-        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
-                                    lr=lr, betas=(0.5, 0.9))
+        opt_ae = torch.optim.Adam(ae_params_list, lr=lr, betas=(0.5, 0.9))
+        opt_disc = torch.optim.Adam(
+            self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)
+        )
         return [opt_ae, opt_disc], []
 
     def get_last_layer(self):
@@ -184,7 +345,9 @@ class AutoencoderKL(pl.LightningModule):
                         # colorize with random projection
                         assert xrec_ema.shape[1] > 3
                         xrec_ema = self.to_rgb(xrec_ema)
-                    log["samples_ema"] = self.decode(torch.randn_like(posterior_ema.sample()))
+                    log["samples_ema"] = self.decode(
+                        torch.randn_like(posterior_ema.sample())
+                    )
                     log["reconstructions_ema"] = xrec_ema
         log["inputs"] = x
         return log
@@ -194,7 +357,7 @@ class AutoencoderKL(pl.LightningModule):
         if not hasattr(self, "colorize"):
             self.register_buffer("colorize", torch.randn(3, x.shape[1], 1, 1).to(x))
         x = F.conv2d(x, weight=self.colorize)
-        x = 2.*(x-x.min())/(x.max()-x.min()) - 1.
+        x = 2.0 * (x - x.min()) / (x.max() - x.min()) - 1.0
         return x
 
 
@@ -216,4 +379,3 @@ class IdentityFirstStage(torch.nn.Module):
 
     def forward(self, x, *args, **kwargs):
         return x
-
