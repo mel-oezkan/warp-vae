@@ -3,7 +3,9 @@ pretrained/
 uv.lock
 __pycache__
 __pycache__/*
-*/__pycache__
+**/__pycache__/
+**/__pycache__/*
+__pycache__*/
 *.pyc
 .venv
 .python-version
@@ -22,3 +24,7 @@ __pycache__*
 config/
 .log
 outputs/
+taming/
+sd_model
+vae-finetuning
+ldm/**/__pycache__/
