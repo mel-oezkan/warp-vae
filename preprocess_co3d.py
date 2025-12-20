@@ -72,6 +72,8 @@ def precompute_bbox(co3d_dir, category, output_dir):
     print("Precomputing bbox for:", category)
     all_masks = sorted(glob(osp.join(category_dir, "*", "masks", "*.png")))
     bboxes = {}
+
+    # iterate over all versions of the category
     for mask_filename in tqdm(all_masks):
         mask = plt.imread(mask_filename)
         # /Dataset/category/sequence/masks/mask.png -> category/sequence/mask/mask.png
@@ -90,7 +92,7 @@ def process_poses(co3d_dir, category, output_dir, min_quality):
     print("Processing category:", category)
     frame_file = osp.join(category_dir, "frame_annotations.jgz")
     sequence_file = osp.join(category_dir, "sequence_annotations.jgz")
-    subset_lists_file = osp.join(category_dir, "set_lists/set_lists_manyview_dev.json")
+    subset_lists_file = osp.join(category_dir, "set_lists/set_lists_fewview_dev.json")
 
     bbox_file = osp.join(output_dir, f"{category}_bbox.jgz")
 
@@ -103,6 +105,7 @@ def process_poses(co3d_dir, category, output_dir, min_quality):
     with gzip.open(frame_file, "r") as fin:
         frame_data = json.loads(fin.read())
 
+    print("Loading precomputed bbox from:", bbox_file)
     with gzip.open(bbox_file, "r") as fin:
         bbox_data = json.loads(fin.read())
 
@@ -145,7 +148,7 @@ def process_poses(co3d_dir, category, output_dir, min_quality):
                 }
             )
 
-        output_file = osp.join(args.output_dir, f"{args.category}_{subset}.jgz")
+        output_file = osp.join(output_dir, f"{category}_{subset}.jgz")
         with gzip.open(output_file, "w") as f:
             f.write(json.dumps(category_data).encode("utf-8"))
 
