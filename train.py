@@ -2,7 +2,7 @@
 import os
 from contextlib import contextmanager
 import torch.nn.functional as F
-
+from pytorch_lightning.callbacks import ModelCheckpoint
 import hydra
 import lpips
 import numpy as np
@@ -177,12 +177,18 @@ class ProcessedCo3D(Dataset):
             patch_num=self.patch_num,
         )
 
-        rays = simple_rays(
-            plucker[..., :3], trans
-        )
+        rays = simple_rays(plucker[..., :3], trans)
 
         # Don't return PIL Image - only return tensors
-        return {"image": image_cropped, "pluck": rays}
+        return {
+            "image": image_cropped,
+            "rays": rays,
+            "crop_params": crop_params,
+            "R": rot,
+            "T": trans,
+            "focal_length": focal_length,
+            "principal_point": principle_point,
+        }
 
 
 class Co3DDataModule(pl.LightningDataModule):
@@ -319,10 +325,9 @@ class FinetuneVAE(pl.LightningModule):
         if self.freeze_decoder:
             print("--> Freezing VAE decoder parameters.")
             # Standard LDM VAE structure usually has 'decoder' and 'post_quant_conv'
-            if hasattr(self.model, 'decoder'):
+            if hasattr(self.model, "decoder"):
                 for param in self.model.decoder.parameters():
                     param.requires_grad = False
-            
 
         # Plücker loss weights
         self.plucker_weights = plucker_weights or {
@@ -337,13 +342,12 @@ class FinetuneVAE(pl.LightningModule):
             self.ema_decay = ema_decay
             assert 0.0 < ema_decay < 1.0
             self.model_ema = LitEma(self.model, decay=ema_decay)
-            
+
         self.use_wandb = use_wandb
 
         # Enable automatic optimization to be False for manual optimizer stepping
         self.automatic_optimization = True
         self.validation_step_outputs = []
-
 
     def configure_optimizers(self):
         params = list(filter(lambda p: p.requires_grad, self.model.parameters()))
@@ -377,15 +381,13 @@ class FinetuneVAE(pl.LightningModule):
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
-        
         target = batch["image"]
-        
+
         if self.precision == 16:
             target = target.half()
 
         posterior, rays = self.model.encode(target)
         z = posterior.sample()
-        
 
         pred = self.model.decode(z)
 
@@ -400,27 +402,31 @@ class FinetuneVAE(pl.LightningModule):
             lpips_loss = self.lpips_loss_fn(pred, target).mean()
 
         pluck_loss = self.hybrid_plucker_loss(batch["pluck"], rays)
-        kl_loss = posterior.kl().mean() * self.kl_weight    
+        kl_loss = posterior.kl().mean() * self.kl_weight
 
         # 3. aggregate loss
         loss = (
-            rec_loss 
-            + (self.lpips_loss_weight * lpips_loss) 
+            rec_loss
+            + (self.lpips_loss_weight * lpips_loss)
             + (self.plucker_loss_weight * pluck_loss)
             + (self.kl_weight * kl_loss)
         )
-     
-     
+
         # 4. Logging
-        self.log_dict({
-            "train/rec_loss": rec_loss,
-            "train/lpips_loss": lpips_loss,
-            "train/ray_loss": self.plucker_loss_weight * pluck_loss,
-            "train/kl_loss": kl_loss,
-            "train/total_loss": loss,
-        }, on_step=True, on_epoch=False, prog_bar=True, logger=True)
-        
-        
+        self.log_dict(
+            {
+                "train/rec_loss": rec_loss,
+                "train/lpips_loss": lpips_loss,
+                "train/ray_loss": self.plucker_loss_weight * pluck_loss,
+                "train/kl_loss": kl_loss,
+                "train/total_loss": loss,
+            },
+            on_step=True,
+            on_epoch=False,
+            prog_bar=True,
+            logger=True,
+        )
+
         return loss
 
     def hybrid_plucker_loss(self, pred, gt):
@@ -465,8 +471,7 @@ class FinetuneVAE(pl.LightningModule):
 
         # Forward pass
         pred, posterior, pred_plucker = self.model(target, sample_posterior=False)
-        
-        
+
         rec_loss = torch.abs(target - pred).mean()
         lpips_loss = self.lpips_loss_fn(pred, target).mean()
         kl_loss = posterior.kl().mean()
@@ -485,17 +490,18 @@ class FinetuneVAE(pl.LightningModule):
         output = {
             "val_loss": loss.detach(),
             "rec_loss": rec_loss.detach(),
-            "plucker_loss": plucker_loss.detach()
+            "plucker_loss": plucker_loss.detach(),
         }
-        
+
         self.validation_step_outputs.append(output)
-        
+
         # Trigger image logging on first batch
         if batch_idx == 0 and self.use_wandb:
-             self.log_images_wandb(target, pred, torch.zeros(target.shape[0])) # Dummy labels
+            self.log_images_wandb(
+                target, pred, torch.zeros(target.shape[0])
+            )  # Dummy labels
 
         return output
-    
 
     def log_images(self, input, output, names):
         if self.log_one_batch:
@@ -571,7 +577,6 @@ class FinetuneVAE(pl.LightningModule):
         )
 
     def on_train_epoch_end(self):
-        print(f"[DEBUG] Training epoch {self.current_epoch} completed")
         if self.use_ema:
             self.model_ema(self.model)
 
@@ -587,23 +592,34 @@ class FinetuneVAE(pl.LightningModule):
 
             if self.use_wandb:
                 self.log(
-                    "lpips_weight_change",
-                    {
-                        "old_weight": old_weight,
-                        "new_weight": self.lpips_loss_weight,
-                        "epoch": self.current_epoch,
-                    },
+                    "lpips/old_weight",
+                    old_weight,
+                    logger=True,
+                )
+                self.log(
+                    "lpips/new_weight",
+                    self.lpips_loss_weight,
+                    logger=True,
+                )
+                self.log(
+                    "lpips/epoch",
+                    self.curret_epoch,
                     logger=True,
                 )
 
-    
     def on_validation_epoch_end(self):
         if self.use_ema:
             self.model_ema.restore(self.model.parameters())
 
-        avg_loss = torch.stack([x["val_loss"] for x in self.validation_step_outputs]).mean()
-        avg_rec = torch.stack([x["rec_loss"] for x in self.validation_step_outputs]).mean()
-        avg_pluck = torch.stack([x["plucker_loss"] for x in self.validation_step_outputs]).mean()
+        avg_loss = torch.stack(
+            [x["val_loss"] for x in self.validation_step_outputs]
+        ).mean()
+        avg_rec = torch.stack(
+            [x["rec_loss"] for x in self.validation_step_outputs]
+        ).mean()
+        avg_pluck = torch.stack(
+            [x["plucker_loss"] for x in self.validation_step_outputs]
+        ).mean()
 
         self.log("val/loss", avg_loss, on_epoch=True, logger=True)
         self.log("val/rec_loss", avg_rec, on_epoch=True, logger=True)
@@ -733,6 +749,14 @@ def main(cfg: DictConfig):
         plucker_weights=plucker_weights,
     )
 
+    checkpoint_cb = ModelCheckpoint(
+        dirpath="checkpoints",
+        filename="vae-epoch{epoch:03d}",
+        save_top_k=-1,  # save all checkpoints
+        every_n_epochs=5,  # 🔑 save every 5 epochs
+        save_last=True,
+    )
+
     trainer = Trainer(
         max_epochs=cfg.training.num_epochs,
         precision=cfg.training.precision,
@@ -743,6 +767,7 @@ def main(cfg: DictConfig):
         logger=wandb_logger if use_wandb else None,
         log_every_n_steps=50,
         check_val_every_n_epoch=1,
+        callbacks=[checkpoint_cb],
     )
 
     print(f"[DEBUG] Starting training for {cfg.training.num_epochs} epochs")
