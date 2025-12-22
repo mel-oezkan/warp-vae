@@ -26,17 +26,12 @@ from data_process.co3d_dataset import jitter_bbox, square_bbox
 from dataclasses import dataclass
 from pathlib import Path
 
-from data_process.plucker import plucker_encodeing, plucker_to_rays, simple_rays
+from data_process.plucker import ray_to_plucker, compute_directions_from_sample
 from typing import cast, IO
 import json
 
 torch.cuda.empty_cache()
 
-
-def sign_invariant_l1(pred, gt):
-    pos = torch.abs(pred - gt).mean(dim=-1)
-    neg = torch.abs(pred + gt).mean(dim=-1)
-    return torch.minimum(pos, neg).mean()
 
 
 @dataclass
@@ -160,35 +155,22 @@ class ProcessedCo3D(Dataset):
         image_cropped = self.transform(image_cropped)
         cropped_size = (image_cropped.shape[1], image_cropped.shape[2])
 
-        rot = torch.tensor(sample["R"], dtype=torch.float32)
-        trans = torch.tensor(sample["T"], dtype=torch.float32)
-        focal_length = torch.tensor(sample["focal_length"], dtype=torch.float32)
-        principle_point = torch.tensor(sample["principal_point"], dtype=torch.float32)
+        sample = {
+            "image": image_cropped,
+            "crop_params": crop_params,
+            "R": sample["R"],
+            "T": sample["T"],
+            "focal_length": sample["focal_length"],
+            "principal_point": sample["principle_point"],
+        }
+        
+        rays = compute_directions_from_sample(sample, self.patch_num)
+        pluck_rays = ray_to_plucker(rays)
 
-        plucker = plucker_encodeing(
-            R=rot,
-            T=trans,
-            fl=focal_length,
-            pp=principle_point,
-            crop_params=crop_params,
-            original_size=(orig_h, orig_w),
-            cropped_size=cropped_size,
-            device=self.device,
-            patch_num=self.patch_num,
-        )
-
-        rays = simple_rays(plucker[..., :3], trans)
+        sample["pluck_ray"] = pluck_rays
 
         # Don't return PIL Image - only return tensors
-        return {
-            "image": image_cropped,
-            "rays": rays,
-            "crop_params": crop_params,
-            "R": rot,
-            "T": trans,
-            "focal_length": focal_length,
-            "principal_point": principle_point,
-        }
+        return sample
 
 
 class Co3DDataModule(pl.LightningDataModule):
@@ -401,7 +383,7 @@ class FinetuneVAE(pl.LightningModule):
         with torch.no_grad():
             lpips_loss = self.lpips_loss_fn(pred, target).mean()
 
-        pluck_loss = self.hybrid_plucker_loss(batch["pluck"], rays)
+        pluck_loss = self.hybrid_plucker_loss(batch["pluck_ray"], rays)
         kl_loss = posterior.kl().mean() * self.kl_weight
 
         # 3. aggregate loss
@@ -440,9 +422,9 @@ class FinetuneVAE(pl.LightningModule):
         pred_d, pred_m = pred[..., :3], pred[..., 3:]
         gt_d, gt_m = gt[..., :3], gt[..., 3:]
 
-        # Simple reconstruction loss (with sign ambiguity handling)
-        loss_d = sign_invariant_l1(pred_d, gt_d)
-        loss_m = sign_invariant_l1(pred_m, gt_m)
+        # Simple l2 reconstruction loss
+        loss_d = F.mse_loss(pred_d, gt_d)
+        loss_m = F.mse_loss(pred_m, gt_m)
 
         recon_loss = loss_d + loss_m
 
