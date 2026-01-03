@@ -25,6 +25,7 @@ from torchvision import transforms
 
 import wandb
 from data_process.co3d_dataset import jitter_bbox, square_bbox
+from data_process.omniobject_dataset import OmniObjectDataModule
 from data_process.plucker import compute_directions_from_sample, ray_to_plucker
 from ldm.modules.ema import LitEma
 from ldm.util import instantiate_from_config
@@ -707,8 +708,17 @@ def main(cfg: DictConfig):
             crop_images=cfg.data.get("crop_images", False),
             patch_num=cfg.data.get("patch_num", None),
         )
+    elif dataset_type == "omniobject":
+        data_module = OmniObjectDataModule(
+            data_dir=cfg.data.data_dir,
+            batch_size=cfg.training.batch_size,
+            val_size=cfg.training.get("val_size", 0.1),
+            size=cfg.training.image_size,
+            patch_num=cfg.data.get("patch_num", None),
+            pair_sampling=cfg.data.get("pair_sampling", "sequential"),
+        )
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Unknown dataset type: {dataset_type}")
 
     # Plücker loss weights from config
     plucker_weights = {
