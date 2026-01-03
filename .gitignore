@@ -29,3 +29,4 @@ sd_model
 vae-finetuning
 ldm/**/__pycache__/
 checkpoints/
+weights/
