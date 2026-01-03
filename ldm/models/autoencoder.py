@@ -10,15 +10,19 @@ from ldm.util import instantiate_from_config
 from ldm.modules.ema import LitEma
 
 
-
 class AutoencoderKL(pl.LightningModule):
+    """
+    Base Variational Autoencoder with KL divergence regularization.
+
+    This is the standard VAE implementation from Stable Diffusion,
+    without any Plucker-specific modifications.
+    """
+
     def __init__(
         self,
         ddconfig,
         lossconfig,
         embed_dim,
-        n_patches: int,
-        plucker_key: str,
         ckpt_path=None,
         ignore_keys=[],
         image_key="image",
@@ -26,8 +30,6 @@ class AutoencoderKL(pl.LightningModule):
         monitor=None,
         ema_decay=None,
         learn_logvar=False,
-        plucker_hidden_dim=512,  # Larger hidden dimension
-        plucker_dropout=0.1,  # Dropout rate
     ):
         super().__init__()
         self.learn_logvar = learn_logvar
@@ -39,32 +41,6 @@ class AutoencoderKL(pl.LightningModule):
         self.quant_conv = torch.nn.Conv2d(2 * ddconfig["z_channels"], 2 * embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
         self.embed_dim = embed_dim
-        self.n_patches = n_patches
-        self.plucker_key = plucker_key
-
-        # map from h to plücker coords
-        # Encoder output has 2*z_channels due to double_z=True
-        encoder_out_channels = 2 * ddconfig["z_channels"]
-        self.pluck_head = torch.nn.Conv2d(encoder_out_channels, 6, kernel_size=1)
-        self.act = torch.nn.SiLU()
-
-        # Build Plücker MLP using template
-        self.pluck_norm_in = torch.nn.LayerNorm(6)
-        self.pluck_proj_layers = torch.nn.ModuleList(
-            [
-                self._make_projection_layer(6, plucker_hidden_dim, plucker_dropout),
-                self._make_projection_layer(
-                    plucker_hidden_dim, plucker_hidden_dim, plucker_dropout
-                ),
-            ]
-        )
-        self.pluck_proj_out = torch.nn.Linear(plucker_hidden_dim, 6)
-
-        # Initialize with small weights for stability
-        for module in self.pluck_proj_layers.modules():
-            if isinstance(module, torch.nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight, gain=0.01)
-        torch.nn.init.xavier_uniform_(self.pluck_proj_out.weight, gain=0.01)
 
         if colorize_nlabels is not None:
             assert type(colorize_nlabels) == int
@@ -81,25 +57,6 @@ class AutoencoderKL(pl.LightningModule):
 
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
-
-    def _make_projection_layer(self, in_dim, out_dim, dropout_rate):
-        """
-        Template for creating a projection layer with normalization and dropout.
-
-        Args:
-            in_dim: Input dimension
-            out_dim: Output dimension
-            dropout_rate: Dropout probability
-
-        Returns:
-            nn.Sequential module containing Linear -> LayerNorm -> SiLU -> Dropout
-        """
-        return torch.nn.Sequential(
-            torch.nn.Linear(in_dim, out_dim),
-            torch.nn.LayerNorm(out_dim),
-            torch.nn.SiLU(),
-            torch.nn.Dropout(dropout_rate),
-        )
 
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
@@ -133,62 +90,52 @@ class AutoencoderKL(pl.LightningModule):
 
     def encode(self, x):
         """
-        Encode input image to VAE latent and Plücker coordinates.
+        Encode input image to VAE latent space.
 
         Args:
             x: Input image tensor (B, C, H, W)
 
         Returns:
             posterior: DiagonalGaussianDistribution for VAE latent
-            pluck: Plücker coordinates (B, n_patches*n_patches, 6)
         """
-        B = x.shape[0]  # Get batch size from input
         h = self.encoder(x)
-
-        # Generate initial Plücker coordinates from encoder output
-        pluck = self.pluck_head(h)  # (B, 6, H, W)
-        pluck = self.act(pluck)
-
-        # Interpolate to n_patches × n_patches spatial size
-        pluck = F.interpolate(
-            pluck,
-            size=(self.n_patches, self.n_patches),
-            mode="bilinear",
-            align_corners=False,
-        )  # (B, 6, n_patches, n_patches)
-
-        # Reshape to (B, n_patches*n_patches, 6) for MLP processing
-        pluck = pluck.permute(0, 2, 3, 1).reshape(B, -1, 6).contiguous()
-
-        # Apply MLP with normalization and dropout
-        pluck = self.pluck_norm_in(pluck)
-
-        # Apply projection layers sequentially
-        for layer in self.pluck_proj_layers:
-            pluck = layer(pluck)
-
-        # Final projection to 6D Plücker space
-        pluck = self.pluck_proj_out(pluck)  # (B, n_patches*n_patches, 6)
-
-        # Generate VAE latent posterior
         moments = self.quant_conv(h)
         posterior = DiagonalGaussianDistribution(moments)
-
-        return posterior, pluck
+        return posterior
 
     def decode(self, z):
+        """
+        Decode latent representation to image space.
+
+        Args:
+            z: Latent representation (B, embed_dim, H', W')
+
+        Returns:
+            Reconstructed image (B, C, H, W)
+        """
         z = self.post_quant_conv(z)
         dec = self.decoder(z)
         return dec
 
     def forward(self, input, sample_posterior=True):
-        posterior, pluck = self.encode(input)
+        """
+        Forward pass through VAE.
+
+        Args:
+            input: Input image tensor
+            sample_posterior: Whether to sample from posterior or use mode
+
+        Returns:
+            dec: Reconstructed image
+            posterior: Posterior distribution
+        """
+        posterior = self.encode(input)
         if sample_posterior:
             z = posterior.sample()
         else:
             z = posterior.mode()
         dec = self.decode(z)
-        return dec, posterior, pluck
+        return dec, posterior
 
     def get_input(self, batch, k):
         x = batch[k]
@@ -199,9 +146,7 @@ class AutoencoderKL(pl.LightningModule):
 
     def training_step(self, batch, batch_idx, optimizer_idx):
         inputs = self.get_input(batch, self.image_key)
-        gt_plucker = batch[self.plucker_key]
-
-        reconstructions, posterior, pred_ray = self(inputs)
+        reconstructions, posterior = self(inputs)
 
         if optimizer_idx == 0:
             # train encoder+decoder+logvar
@@ -215,11 +160,6 @@ class AutoencoderKL(pl.LightningModule):
                 split="train",
             )
 
-            # Compute Plücker loss
-            plucker_loss = self.hybrid_plucker_loss(pred_ray, gt_plucker.detach())
-
-            total_loss = aeloss + plucker_loss
-
             self.log(
                 "aeloss",
                 aeloss,
@@ -228,18 +168,10 @@ class AutoencoderKL(pl.LightningModule):
                 on_step=True,
                 on_epoch=True,
             )
-            self.log(
-                "plucker_loss",
-                plucker_loss,
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True,
-            )
             self.log_dict(
                 log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False
             )
-            return total_loss
+            return aeloss
 
         if optimizer_idx == 1:
             # train the discriminator
@@ -274,8 +206,7 @@ class AutoencoderKL(pl.LightningModule):
 
     def _validation_step(self, batch, batch_idx, postfix=""):
         inputs = self.get_input(batch, self.image_key)
-        gt_plucker = batch[self.plucker_key]
-        reconstructions, posterior, pred_plucker = self(inputs)
+        reconstructions, posterior = self(inputs)
         aeloss, log_dict_ae = self.loss(
             inputs,
             reconstructions,
@@ -296,10 +227,7 @@ class AutoencoderKL(pl.LightningModule):
             split="val" + postfix,
         )
 
-        plucker_loss = self.hybrid_plucker_loss(pred_plucker, gt_plucker)
-
         self.log(f"val{postfix}/rec_loss", log_dict_ae[f"val{postfix}/rec_loss"])
-        self.log(f"val{postfix}/plucker_loss", plucker_loss)
         self.log_dict(log_dict_ae)
         self.log_dict(log_dict_disc)
         return self.log_dict
@@ -361,7 +289,322 @@ class AutoencoderKL(pl.LightningModule):
         return x
 
 
+class PluckerAutoencoder(AutoencoderKL):
+    """
+    AutoencoderKL extended with Plucker coordinate prediction.
+
+    This class adds auxiliary Plucker ray prediction to the standard VAE,
+    enabling camera-aware representation learning for multi-view consistency.
+    """
+
+    def __init__(
+        self,
+        ddconfig,
+        lossconfig,
+        embed_dim,
+        n_patches: int,
+        plucker_key: str = "pluck_ray",
+        ckpt_path=None,
+        ignore_keys=[],
+        image_key="image",
+        colorize_nlabels=None,
+        monitor=None,
+        ema_decay=None,
+        learn_logvar=False,
+        plucker_hidden_dim=512,
+        plucker_dropout=0.1,
+        plucker_weights=None,
+    ):
+        """
+        Initialize Plucker-aware autoencoder.
+
+        Args:
+            ddconfig: Encoder/decoder configuration
+            lossconfig: Loss function configuration
+            embed_dim: Embedding dimension for VAE latent
+            n_patches: Number of patches per dimension (e.g., 8 for 8x8 grid)
+            plucker_key: Key for Plucker coordinates in batch dict
+            plucker_hidden_dim: Hidden dimension for Plucker MLP
+            plucker_dropout: Dropout rate for Plucker MLP
+            plucker_weights: Dict with keys "recon", "constraint", "norm" for loss weights
+        """
+        super().__init__(
+            ddconfig=ddconfig,
+            lossconfig=lossconfig,
+            embed_dim=embed_dim,
+            ckpt_path=None,  # Don't load checkpoint yet
+            ignore_keys=ignore_keys,
+            image_key=image_key,
+            colorize_nlabels=colorize_nlabels,
+            monitor=monitor,
+            ema_decay=ema_decay,
+            learn_logvar=learn_logvar,
+        )
+
+        self.n_patches = n_patches
+        self.plucker_key = plucker_key
+
+        # Plucker loss weights
+        if plucker_weights is None:
+            plucker_weights = {"recon": 1.0, "constraint": 0.1, "norm": 0.1}
+        self.plucker_weights = plucker_weights
+
+        # Plucker prediction head
+        encoder_out_channels = 2 * ddconfig["z_channels"]
+        self.pluck_head = torch.nn.Conv2d(encoder_out_channels, 6, kernel_size=1)
+        self.act = torch.nn.SiLU()
+
+        # Plucker MLP for refinement
+        self.pluck_norm_in = torch.nn.LayerNorm(6)
+        self.pluck_proj_layers = torch.nn.ModuleList(
+            [
+                self._make_projection_layer(6, plucker_hidden_dim, plucker_dropout),
+                self._make_projection_layer(
+                    plucker_hidden_dim, plucker_hidden_dim, plucker_dropout
+                ),
+            ]
+        )
+        self.pluck_proj_out = torch.nn.Linear(plucker_hidden_dim, 6)
+
+        # Initialize with small weights for stability
+        for module in self.pluck_proj_layers.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight, gain=0.01)
+        torch.nn.init.xavier_uniform_(self.pluck_proj_out.weight, gain=0.01)
+
+        # Load checkpoint after Plucker components are initialized
+        if ckpt_path is not None:
+            self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+    def _make_projection_layer(self, in_dim, out_dim, dropout_rate):
+        """
+        Create a projection layer with normalization and dropout.
+
+        Args:
+            in_dim: Input dimension
+            out_dim: Output dimension
+            dropout_rate: Dropout probability
+
+        Returns:
+            Sequential module: Linear -> LayerNorm -> SiLU -> Dropout
+        """
+        return torch.nn.Sequential(
+            torch.nn.Linear(in_dim, out_dim),
+            torch.nn.LayerNorm(out_dim),
+            torch.nn.SiLU(),
+            torch.nn.Dropout(dropout_rate),
+        )
+
+    def encode(self, x):
+        """
+        Encode input image to VAE latent and Plucker coordinates.
+
+        Args:
+            x: Input image tensor (B, C, H, W)
+
+        Returns:
+            posterior: DiagonalGaussianDistribution for VAE latent
+            pluck: Plucker coordinates (B, n_patches*n_patches, 6)
+        """
+        B = x.shape[0]
+        h = self.encoder(x)
+
+        # Generate Plucker coordinates from encoder output
+        pluck = self.pluck_head(h)  # (B, 6, H, W)
+        pluck = self.act(pluck)
+
+        # Interpolate to n_patches × n_patches spatial size
+        pluck = F.interpolate(
+            pluck,
+            size=(self.n_patches, self.n_patches),
+            mode="bilinear",
+            align_corners=False,
+        )  # (B, 6, n_patches, n_patches)
+
+        # Reshape to (B, n_patches*n_patches, 6) for MLP processing
+        pluck = pluck.permute(0, 2, 3, 1).reshape(B, -1, 6).contiguous()
+
+        # Apply MLP with normalization and dropout
+        pluck = self.pluck_norm_in(pluck)
+
+        # Apply projection layers sequentially
+        for layer in self.pluck_proj_layers:
+            pluck = layer(pluck)
+
+        # Final projection to 6D Plucker space
+        pluck = self.pluck_proj_out(pluck)  # (B, n_patches*n_patches, 6)
+
+        # Generate VAE latent posterior
+        moments = self.quant_conv(h)
+        posterior = DiagonalGaussianDistribution(moments)
+
+        return posterior, pluck
+
+    def forward(self, input, sample_posterior=True):
+        """
+        Forward pass through Plucker-aware VAE.
+
+        Args:
+            input: Input image tensor
+            sample_posterior: Whether to sample from posterior or use mode
+
+        Returns:
+            dec: Reconstructed image
+            posterior: Posterior distribution
+            pluck: Predicted Plucker coordinates
+        """
+        posterior, pluck = self.encode(input)
+        if sample_posterior:
+            z = posterior.sample()
+        else:
+            z = posterior.mode()
+        dec = self.decode(z)
+        return dec, posterior, pluck
+
+    def hybrid_plucker_loss(self, pred, gt):
+        """
+        Compute hybrid Plucker loss with reconstruction, constraint, and normalization.
+
+        The loss combines:
+        1. Reconstruction: MSE between predicted and ground truth
+        2. Constraint: Enforces d·m = 0 (Plucker constraint)
+        3. Normalization: Encourages unit direction vectors
+
+        Args:
+            pred: Predicted Plucker coordinates (B, n_patches*n_patches, 6)
+            gt: Ground truth Plucker coordinates (B, n_patches*n_patches, 6)
+
+        Returns:
+            Weighted combination of loss terms
+        """
+        pred_d, pred_m = pred[..., :3], pred[..., 3:]
+        gt_d, gt_m = gt[..., :3], gt[..., 3:]
+
+        # Reconstruction loss (MSE)
+        loss_d = F.mse_loss(pred_d, gt_d)
+        loss_m = F.mse_loss(pred_m, gt_m)
+        recon_loss = loss_d + loss_m
+
+        # Constraint: d·m = 0 (orthogonality)
+        constraint_loss = torch.mean((pred_d * pred_m).sum(dim=-1) ** 2)
+
+        # Normalization: encourage unit direction vectors
+        norm_loss = F.mse_loss(
+            torch.norm(pred_d, dim=-1), torch.ones_like(torch.norm(pred_d, dim=-1))
+        )
+
+        return (
+            self.plucker_weights["recon"] * recon_loss
+            + self.plucker_weights["constraint"] * constraint_loss
+            + self.plucker_weights["norm"] * norm_loss
+        )
+
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        inputs = self.get_input(batch, self.image_key)
+        gt_plucker = batch[self.plucker_key]
+
+        reconstructions, posterior, pred_ray = self(inputs)
+
+        if optimizer_idx == 0:
+            # train encoder+decoder+logvar
+            aeloss, log_dict_ae = self.loss(
+                inputs,
+                reconstructions,
+                posterior,
+                optimizer_idx,
+                self.global_step,
+                last_layer=self.get_last_layer(),
+                split="train",
+            )
+
+            # Compute Plucker loss
+            plucker_loss = self.hybrid_plucker_loss(pred_ray, gt_plucker.detach())
+
+            total_loss = aeloss + plucker_loss
+
+            self.log(
+                "aeloss",
+                aeloss,
+                prog_bar=True,
+                logger=True,
+                on_step=True,
+                on_epoch=True,
+            )
+            self.log(
+                "plucker_loss",
+                plucker_loss,
+                prog_bar=True,
+                logger=True,
+                on_step=True,
+                on_epoch=True,
+            )
+            self.log_dict(
+                log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False
+            )
+            return total_loss
+
+        if optimizer_idx == 1:
+            # train the discriminator
+            discloss, log_dict_disc = self.loss(
+                inputs,
+                reconstructions,
+                posterior,
+                optimizer_idx,
+                self.global_step,
+                last_layer=self.get_last_layer(),
+                split="train",
+            )
+
+            self.log(
+                "discloss",
+                discloss,
+                prog_bar=True,
+                logger=True,
+                on_step=True,
+                on_epoch=True,
+            )
+            self.log_dict(
+                log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False
+            )
+            return discloss
+
+    def _validation_step(self, batch, batch_idx, postfix=""):
+        inputs = self.get_input(batch, self.image_key)
+        gt_plucker = batch[self.plucker_key]
+        reconstructions, posterior, pred_plucker = self(inputs)
+
+        aeloss, log_dict_ae = self.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            0,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="val" + postfix,
+        )
+
+        discloss, log_dict_disc = self.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            1,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="val" + postfix,
+        )
+
+        plucker_loss = self.hybrid_plucker_loss(pred_plucker, gt_plucker)
+
+        self.log(f"val{postfix}/rec_loss", log_dict_ae[f"val{postfix}/rec_loss"])
+        self.log(f"val{postfix}/plucker_loss", plucker_loss)
+        self.log_dict(log_dict_ae)
+        self.log_dict(log_dict_disc)
+        return self.log_dict
+
+
 class IdentityFirstStage(torch.nn.Module):
+    """Identity first stage for compatibility."""
+
     def __init__(self, *args, vq_interface=False, **kwargs):
         self.vq_interface = vq_interface
         super().__init__()
