@@ -1,9 +1,9 @@
 model:
-    target: ldm.models.autoencoder.AutoencoderKL
+    target: ldm.models.autoencoder.PluckerAutoencoder
     params:
         embed_dim: 4
         n_patches: 8
-        plucker_key: "pluck"
+        plucker_key: "pluck_ray"
         monitor: val/rec_loss
         ddconfig:
             double_z: true
