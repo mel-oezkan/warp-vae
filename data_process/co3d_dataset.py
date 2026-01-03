@@ -15,26 +15,69 @@ from data_process.data_types import (
 )
 import json
 import warnings
+from data_process.plucker import plucker_encodeing
 
 
 CATEGORIES = [
-    "apple", "backpack", "ball", "banana", "baseballbat", "baseballglove",
-    "bench", "bicycle", "book", "bottle", "bowl", "broccoli", "cake", "car", "carrot",
-    "cellphone", "chair", "couch", "cup", "donut", "frisbee", "hairdryer", "handbag",
-    "hotdog", "hydrant", "keyboard", "kite", "laptop", "microwave", "motorcycle",
-    "mouse", "orange", "parkingmeter", "pizza", "plant", "remote", "sandwich",
-    "skateboard", "stopsign", "suitcase", "teddybear", "toaster", "toilet", "toybus",
-    "toyplane", "toytrain", "toytruck", "tv", "umbrella", "vase", "wineglass",
+    "apple",
+    "backpack",
+    "ball",
+    "banana",
+    "baseballbat",
+    "baseballglove",
+    "bench",
+    "bicycle",
+    "book",
+    "bottle",
+    "bowl",
+    "broccoli",
+    "cake",
+    "car",
+    "carrot",
+    "cellphone",
+    "chair",
+    "couch",
+    "cup",
+    "donut",
+    "frisbee",
+    "hairdryer",
+    "handbag",
+    "hotdog",
+    "hydrant",
+    "keyboard",
+    "kite",
+    "laptop",
+    "microwave",
+    "motorcycle",
+    "mouse",
+    "orange",
+    "parkingmeter",
+    "pizza",
+    "plant",
+    "remote",
+    "sandwich",
+    "skateboard",
+    "stopsign",
+    "suitcase",
+    "teddybear",
+    "toaster",
+    "toilet",
+    "toybus",
+    "toyplane",
+    "toytrain",
+    "toytruck",
+    "tv",
+    "umbrella",
+    "vase",
+    "wineglass",
 ]
 
 
 # image augmentation
 def jitter_bbox(square_bbox, jitter_scale=(1.1, 1.2), jitter_trans=(-0.07, 0.07)):
     square_bbox = np.array(square_bbox.astype(float))
-
     s = np.random.uniform(jitter_scale[0], jitter_scale[1])
     tx, ty = np.random.uniform(jitter_trans[0], jitter_trans[1], size=2)
-    
     side_length = square_bbox[2] - square_bbox[0]
     center = (square_bbox[:2] + square_bbox[2:]) / 2 + np.array([tx, ty]) * side_length
     extent = side_length / 2 * s
@@ -75,6 +118,8 @@ class CO3D_Dataset(Dataset):
         transform=None,
         crop_images=True,
         apply_augmentation=True,
+        patch_num=None,
+        device=None,
     ):
         super().__init__()
         self.root_dir = root_dir
@@ -83,6 +128,8 @@ class CO3D_Dataset(Dataset):
         self.crop_images = crop_images
         self.apply_augmentation = apply_augmentation
         self.transform = transform
+        self.device = device
+        self.patch_num = patch_num
 
         if self.transform is None:
             self.transform = transforms.Compose(
@@ -148,6 +195,29 @@ class CO3D_Dataset(Dataset):
         subset_items = set_lists.get(subset, [])
 
         self.sequence_name = subset_items[0][0]
+
+        self.pointcloud = None
+        if not self.is_dev:
+            self.pointcloud = None
+        else:
+            seq_ann = self.seq_dict.get(self.sequence_name)
+            if seq_ann and seq_ann.point_cloud:
+                import open3d
+
+                pc_path = seq_ann.point_cloud.path
+                pc_score = seq_ann.point_cloud.quality_score
+                pc_num_points = seq_ann.point_cloud.n_points
+
+                pcd_full_path = os.path.join(self.root_dir, pc_path)
+                if os.path.exists(pcd_full_path):
+                    pcd = open3d.io.read_point_cloud(pcd_full_path)
+                    points = np.asarray(pcd.points)
+                    self.pointcloud = torch.from_numpy(points).float()
+                else:
+                    self.pointcloud = None
+
+            else:
+                self.pointcloud = None
 
         # create the list of frames
         self.samples = []
@@ -263,29 +333,19 @@ class CO3D_Dataset(Dataset):
         else:
             R = T = focal_length = principle_point = scale_adjustment = None
 
-        # pointcloud
+        # plucker
 
-        if not self.is_dev:
-            pointcloud = None
-        else:
-            seq_ann = self.seq_dict.get(self.sequence_name)
-            if seq_ann and seq_ann.point_cloud:
-                import open3d
-
-                pc_path = seq_ann.point_cloud.path
-                pc_score = seq_ann.point_cloud.quality_score
-                pc_num_points = seq_ann.point_cloud.n_points
-
-                pcd_full_path = os.path.join(self.root_dir, pc_path)
-                if os.path.exists(pcd_full_path):
-                    pcd = open3d.io.read_point_cloud(pcd_full_path)
-                    points = np.asarray(pcd.points)
-                    pointcloud = torch.from_numpy(points).float()
-                else:
-                    pointcloud = None
-
-            else:
-                pointcloud = None
+        plucker = plucker_encodeing(
+            R=R,
+            T=T,
+            fl=focal_length,
+            pp=principle_point,
+            crop_params=crop_params,
+            original_size=original_size,
+            cropped_size=cropped_size,
+            device=self.device,
+            patch_num=self.patch_num,
+        )
 
         return {
             "category": self.category,
@@ -299,12 +359,13 @@ class CO3D_Dataset(Dataset):
             "T": T,
             "focal_length": focal_length,
             "principle_point": principle_point,
-            "pointcloud": pointcloud,
+            # "pointcloud":pointcloud,
             "sequence_name": self.sequence_name,
-            "frame_nubmer": frame_num,
+            "frame_numer": frame_num,
             "cropped_image": image_cropped,
             "cropped_size": cropped_size,
             "crop_params": crop_params,
+            "plucker": plucker,
         }
 
     def get_all_images(self):
@@ -374,8 +435,7 @@ def calc_depth_features(depth: torch.Tensor, scale: float, depth_mask: torch.Ten
 
     valid_pixels = (mask > mask.mean() * 0.1) & (depth_meters > 0)
     if valid_pixels.sum() == 0:
-        return float("nan")
-    
+        return [float("nan"), float("nan"), float("nan")]
     mean_depth = depth_meters[valid_pixels].mean().item()
     std_depth = depth_meters[valid_pixels].std().item()
     median_depth = depth_meters[valid_pixels].median().item()
@@ -403,3 +463,62 @@ def spherical_interpolation(z1: torch.Tensor, z2: torch.Tensor, alphas):
         ) * x2
 
     return [calc(a, z1, z2) for a in alphas]
+
+
+# load the data of entire category
+def load_entire_category(
+    category: str,
+    root_dir: str,
+    bbox_dir: str,
+    patch_num: int = None,
+):
+    category_path = os.path.join(root_dir, category)
+    num_subfolders = sum(
+        os.path.isdir(os.path.join(category_path, name))
+        for name in os.listdir(category_path)
+    )
+    # print(num_subfolders)
+
+    datasets = []
+    if num_subfolders == 3:
+        dataset = CO3D_Dataset(
+            root_dir=root_dir,
+            bbox_dir=bbox_dir,
+            category=category,
+            subset_name="test_0",
+            subset="train",
+            patch_num=patch_num,
+        )
+        datasets.append(dataset)
+    elif num_subfolders == 5:
+        dataset_dev_0 = CO3D_Dataset(
+            root_dir=root_dir,
+            bbox_dir=bbox_dir,
+            category=category,
+            subset_name="dev_0",
+            subset="train",
+            patch_num=patch_num,
+        )
+        datasets.append(dataset_dev_0)
+
+        dataset_dev_1 = CO3D_Dataset(
+            root_dir=root_dir,
+            bbox_dir=bbox_dir,
+            category=category,
+            subset_name="dev_1",
+            subset="train",
+            patch_num=patch_num,
+        )
+        datasets.append(dataset_dev_1)
+
+        dataset_test_0 = CO3D_Dataset(
+            root_dir=root_dir,
+            bbox_dir=bbox_dir,
+            category=category,
+            subset_name="test_0",
+            subset="train",
+            patch_num=patch_num,
+        )
+        datasets.append(dataset_test_0)
+
+    return datasets
