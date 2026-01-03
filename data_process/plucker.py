@@ -234,3 +234,157 @@ def plucker_encodeing(
         return plucker_from_all_pixels(R=R, T=T, pixel_grid=pixel_grid, fl=fl, pp=pp)
     else:
         return plucker_from_patches(R=R, T=T, pixel_grid=pixel_grid, fl=fl, pp=pp)
+
+
+def plucker_to_rays(pluck_feats: torch.Tensor, normalize_moment: bool = True):
+    """
+    Args:
+        pluck_feats: (..., 6) tensor [direction(3), moment(3)]
+    Returns:
+        rays: (..., 6) tensor [origin(3), direction(3)]
+    """
+    direction = torch.nn.functional.normalize(pluck_feats[..., :3], dim=-1)
+
+    moment = pluck_feats[..., 3:]
+
+    if normalize_moment:
+        c = torch.linalg.norm(direction, dim=-1, keepdim=True).clamp_min(1e-8)
+        moment = moment / c
+
+    # closest point to origin
+    points = torch.cross(direction, moment, dim=-1)
+
+    rays = torch.cat((points, direction), dim=-1)
+    return rays
+
+def simple_rays(directions: torch.Tensor, cam_pos: torch.Tensor):
+    """
+    Args:
+        directions: (..., 3) tensor
+        cam_pos: (..., 3) tensor
+    Returns:
+        rays: (..., 6) tensor [origin(3), direction(3)]
+    """
+    direction = torch.nn.functional.normalize(directions, dim=-1)
+    points = cam_pos + direction 
+
+    rays = torch.cat((points, direction), dim=-1)
+    return rays
+
+def ray_to_plucker(in_ray):
+    """
+    Convert to plucker representation <D, OxD>.
+    """
+
+    ray = in_ray.clone()
+    ray_origins = ray[..., :3]
+    ray_directions = ray[..., 3:]
+    # Normalize ray directions to unit vectors
+    ray_directions = ray_directions / ray_directions.norm(dim=-1, keepdim=True)
+    plucker_normal = torch.cross(ray_origins, ray_directions, dim=-1)
+    plucker_ray = torch.cat([ray_directions, plucker_normal], dim=-1)
+    
+    return plucker_ray
+
+
+def compute_ndc_coordinates(
+    crop_parameters=None,
+    use_half_pix=True,
+    num_patches_x=16,
+    num_patches_y=16,
+    device=None,
+):
+    """
+    Computes NDC Grid using crop_parameters. If crop_parameters is not provided,
+    then it assumes that the crop is the entire image (corresponding to an NDC grid
+    where top left corner is (1, 1) and bottom right corner is (-1, -1)).
+    """
+    if crop_parameters is None:
+        cc_x, cc_y, width = 0, 0, 2
+    else:
+        device = crop_parameters.device
+        cc_x, cc_y, width, _ = crop_parameters
+
+    dx = 1 / num_patches_x
+    dy = 1 / num_patches_y
+    if use_half_pix:
+        min_y = 1 - dy
+        max_y = -min_y
+        min_x = 1 - dx
+        max_x = -min_x
+    else:
+        min_y = min_x = 1
+        max_y = -1 + 2 * dy
+        max_x = -1 + 2 * dx
+
+    y, x = torch.meshgrid(
+        torch.linspace(min_y, max_y, num_patches_y, dtype=torch.float32, device=device),
+        torch.linspace(min_x, max_x, num_patches_x, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+    x_prime = x * width / 2 - cc_x
+    y_prime = y * width / 2 - cc_y
+    xyd_grid = torch.stack([x_prime, y_prime, torch.ones_like(x)], dim=-1)
+    return xyd_grid
+
+
+def unproject_points(curr_sample, xyd_grid):
+    xyz_flattened = xyd_grid.reshape(-1, 3)
+
+    xy = xyz_flattened[..., :2]  # (N, 2)
+    depth = xyz_flattened[..., 2:3]  # (N, 1)
+
+    # Handle focal length
+    if isinstance(curr_sample["focal_length"], (int, float)):
+        fx = fy = curr_sample["focal_length"]
+    else:
+        fx, fy = curr_sample["focal_length"][0], curr_sample["focal_length"][1]
+
+    # Handle principal point
+    px = curr_sample["principal_point"][..., 0]
+    py = curr_sample["principal_point"][..., 1]
+
+
+    # Step 2: Convert camera parameters to NDC if needed
+    fx_ndc = fx
+    fy_ndc = fy
+    px_ndc = px
+    py_ndc = py
+
+
+    X = (xy[..., 0:1] - px_ndc) * depth / fx_ndc
+    Y = (xy[..., 1:2] - py_ndc) * depth / fy_ndc
+    Z = depth
+
+    # Points in camera view coordinates (shape: N, 3)
+    points_view = torch.cat([X, Y, Z], dim=-1)
+
+
+    # Step 4: Transform to world coordinates if needed
+    # Camera view to world: X_world = R^T @ (X_cam - T)
+    R = curr_sample["R"].unsqueeze(0)  # (1, 3, 3)
+    T = curr_sample["T"].unsqueeze(0)  # (1, 3)
+    
+    # Compute camera center in world coordinates
+    camera_center = -(R.transpose(-2, -1) @ T.unsqueeze(-1)).squeeze(-1)  # (N_cams, 3)
+    
+    # Single camera
+    points_world = (R[0].T @ points_view.T).T + camera_center[0]  # (N, 3)
+    return points_world, camera_center[0]
+    
+
+def compute_directions_from_sample(sample, patch_size: int) -> torch.Tensor:
+    xyd_grid = compute_ndc_coordinates(
+        crop_parameters=sample["crop_params"],
+        use_half_pix=True,
+        num_patches_x=patch_size,
+        num_patches_y=patch_size,
+    )
+
+    unprojected, origins = unproject_points(sample, xyd_grid)
+    # unprojected =  unprojected.unsqueeze(0) # (N, P, 3)
+
+    origins = origins.repeat(patch_size * patch_size, 1)  # (N, P, 3)
+    directions = unprojected - origins
+
+    return torch.cat((origins, directions), dim=-1)
