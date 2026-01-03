@@ -1,34 +1,33 @@
 # https://github.com/Leminhbinh0209/FinetuneVAE-SD/tree/main
+import gzip
+import json
 import os
 from contextlib import contextmanager
-import torch.nn.functional as F
-from pytorch_lightning.callbacks import ModelCheckpoint
+from dataclasses import dataclass
+from pathlib import Path
+from typing import IO, List, Optional, cast
+
 import hydra
 import lpips
 import numpy as np
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
-import wandb
+from coolname import generate_slug
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from torch.utils.data import Dataset, random_split
 from torchvision import transforms
 
+import wandb
+from data_process.co3d_dataset import jitter_bbox, square_bbox
+from data_process.plucker import compute_directions_from_sample, ray_to_plucker
 from ldm.modules.ema import LitEma
 from ldm.util import instantiate_from_config
-
-from typing import Optional, List
-import gzip
-from data_process.co3d_dataset import jitter_bbox, square_bbox
-from dataclasses import dataclass
-from pathlib import Path
-
-from data_process.plucker import ray_to_plucker, compute_directions_from_sample
-from typing import cast, IO
-import json
 
 torch.cuda.empty_cache()
 
@@ -158,10 +157,10 @@ class ProcessedCo3D(Dataset):
         sample = {
             "image": image_cropped,
             "crop_params": crop_params,
-            "R": sample["R"],
-            "T": sample["T"],
-            "focal_length": sample["focal_length"],
-            "principal_point": sample["principle_point"],
+            "R": torch.Tensor(sample["R"]),
+            "T": torch.Tensor(sample["T"]),
+            "focal_length": torch.Tensor(sample["focal_length"]),
+            "principal_point": torch.Tensor(sample["principal_point"]),
         }
         
         rays = compute_directions_from_sample(sample, self.patch_num)
@@ -585,7 +584,7 @@ class FinetuneVAE(pl.LightningModule):
                 )
                 self.log(
                     "lpips/epoch",
-                    self.curret_epoch,
+                    self.current_epoch,
                     logger=True,
                 )
 
@@ -639,8 +638,11 @@ def main(cfg: DictConfig):
     use_wandb = cfg.get("wandb", {}).get("enabled", True)
     wandb_logger = None
 
-    if use_wandb:
-        run_name = f"vae_finetune_lr{cfg.training.lr}_bs{cfg.training.batch_size}_ep{cfg.training.num_epochs}"
+    run_name = generate_slug()
+
+    if use_wandb:  
+
+        run_name = run_name
         if hasattr(cfg.training, "note") and cfg.training.note:
             run_name += f"_{cfg.training.note}"
 
@@ -732,7 +734,7 @@ def main(cfg: DictConfig):
     )
 
     checkpoint_cb = ModelCheckpoint(
-        dirpath="checkpoints",
+        dirpath="checkpoints" + "/" + run_name,
         filename="vae-epoch{epoch:03d}",
         save_top_k=-1,  # save all checkpoints
         every_n_epochs=5,  # 🔑 save every 5 epochs
