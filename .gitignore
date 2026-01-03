@@ -30,3 +30,4 @@ vae-finetuning
 ldm/**/__pycache__/
 checkpoints/
 weights/
+.claude/
