@@ -13,10 +13,10 @@ Produce similar results, demonstrating the model has learned equivariant represe
 import os
 import torch
 import matplotlib.pyplot as plt
+import numpy as np
 from pathlib import Path
 from omegaconf import OmegaConf
 from ldm.models.autoencoder import EQVAEAutoencoder
-from ldm.util import instantiate_from_config
 
 
 def validate_equivariance(model, x, transform_params):
@@ -97,10 +97,9 @@ def visualize_equivariance(config_path='config/eqvae_omniobject.yaml',
 
     # Instantiate model
     print("Instantiating EQVAEAutoencoder...")
-    loss_module = instantiate_from_config(config.model.params.lossconfig)
     model = EQVAEAutoencoder(
         ddconfig=config.model.params.ddconfig,
-        lossconfig=loss_module,
+        lossconfig=config.model.params.lossconfig,  # Pass config dict, not instantiated object
         embed_dim=config.model.params.embed_dim,
         p_prior=config.model.params.get('p_prior', 0.9),
         scale_range=config.model.params.get('scale_range', [0.25, 1.0]),
