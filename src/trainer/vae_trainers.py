@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, Any, Tuple, List, Optional
 
-from src.trainers.base_trainer import BaseVAETrainer
+from src.trainer.base_trainer import BaseVAETrainer
 
 
 class VanillaVAETrainer(BaseVAETrainer):

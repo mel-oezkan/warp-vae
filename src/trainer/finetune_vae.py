@@ -6,7 +6,7 @@ Kept for backward compatibility with existing configs.
 """
 
 import warnings
-from src.trainers.vae_trainers import PluckerVAETrainer
+from src.trainer.vae_trainers import PluckerVAETrainer
 
 
 class FinetuneVAE(PluckerVAETrainer):
