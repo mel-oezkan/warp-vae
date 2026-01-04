@@ -126,9 +126,9 @@ data:
     num_workers: 4
 ```
 
-## Phase 3: Config Structure
+## Phase 4: Config Structure
 
-### 3.1 Example Config for Vanilla VAE
+### 4.1 Example Config for Vanilla VAE
 File: `config/train_vanilla_vae.yaml`
 ```Yaml
 model:
@@ -149,7 +149,7 @@ data:
         include_plucker: false
 ```
 
-### 3.2 Example Config for Plucker VAE
+### 4.2 Example Config for Plucker VAE
 File: `config/train_plucker_vae.yaml`
 ```Yaml
 model:
@@ -170,16 +170,25 @@ data:
       params:
         include_plucker: true
 ```
-### 3.3 Example Config for EQ-VAE
+### 4.3 Example Config for EQ-VAE
 File: `config/train_eqvae.yaml`
 ```Yaml
 ```
 
+# Todos
+- [ ] Let Claude test the existing dataset implementations
+- [ ] Let claude make the datasets work with the new boilerplate code
+- [ ] Create the configs 
+- [ ] Extend the training script to work with the new models and datasets
+- [ ] Write tests for data+model combinations    
+
+- check how good the ImageNet implementation was and possibly also include it into the training
 
 # Migration Path
 Phase 1: Create base_trainer.py and vae_trainers.py - refactor existing FinetuneVAE ✅ 
 Phase 2: Create VAEDataModule - wrap existing datasets ✅ 
 Phase 3: Modify the old Datasets to work withe the new data factory and Data module **CURRENT** 
+  - look at the implementations in src/dataset/co3d.py and src/dataset/omni_obj.py and get adapt to existing code
 Phase 4: Create example configs for each model type
 Phase 5: Test the dataset implementation
 Phase 6: Update train.py to use new structure
