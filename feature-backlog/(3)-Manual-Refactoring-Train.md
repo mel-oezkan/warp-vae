@@ -175,16 +175,12 @@ File: `config/train_eqvae.yaml`
 ```Yaml
 ```
 
-## Phase 4: Modify train.py
-File Structure After Implementation
-```Python
-```
-
-
 
 # Migration Path
-Phase 1: Create base_trainer.py and vae_trainers.py - refactor existing FinetuneVAE
-Phase 2: Create VAEDataModule - wrap existing datasets
-Phase 3: Create example configs for each model type
-Phase 4: Update train.py to use new structure
-Phase 5: Test each model/dataset combination
+Phase 1: Create base_trainer.py and vae_trainers.py - refactor existing FinetuneVAE ✅ 
+Phase 2: Create VAEDataModule - wrap existing datasets ✅ 
+Phase 3: Modify the old Datasets to work withe the new data factory and Data module **CURRENT** 
+Phase 4: Create example configs for each model type
+Phase 5: Test the dataset implementation
+Phase 6: Update train.py to use new structure
+Phase 7: Test each model/dataset combination
