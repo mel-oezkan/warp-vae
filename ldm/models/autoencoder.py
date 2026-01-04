@@ -602,6 +602,313 @@ class PluckerAutoencoder(AutoencoderKL):
         return self.log_dict
 
 
+class EQVAEAutoencoder(AutoencoderKL):
+    """
+    Equivariant VAE extending AutoencoderKL with latent-space transformations.
+
+    Implements the EQ-VAE approach: applies random scaling and rotation transformations
+    to latent codes during training to learn equivariant representations.
+
+    Key features:
+    - Isotropic scaling transformations on latent codes
+    - 90-degree rotation transformations
+    - Probabilistic regularization (p_prior)
+    - LPIPS + adversarial discriminator loss (via LPIPSWithDiscriminator)
+    """
+
+    def __init__(
+        self,
+        ddconfig,
+        lossconfig,
+        embed_dim,
+        ckpt_path=None,
+        ignore_keys=[],
+        image_key="image",
+        colorize_nlabels=None,
+        monitor=None,
+        ema_decay=None,
+        learn_logvar=False,
+        # EQ-VAE specific parameters
+        p_prior=0.9,              # Probability of applying equivariance loss
+        scale_range=None,         # Isotropic scaling range [min, max]
+        use_rotation=True,        # Enable 90-degree rotations
+        equivariance_weight=1.0,  # Weight for equivariance loss term
+    ):
+        """
+        Initialize Equivariant VAE.
+
+        Args:
+            ddconfig: Encoder/decoder configuration
+            lossconfig: Loss function configuration (should be LPIPSWithDiscriminator)
+            embed_dim: Embedding dimension for VAE latent
+            ckpt_path: Path to checkpoint for initialization
+            ignore_keys: Keys to ignore when loading checkpoint
+            image_key: Key for images in batch dict
+            colorize_nlabels: Number of labels for colorization
+            monitor: Metric to monitor for checkpointing
+            ema_decay: Exponential moving average decay rate
+            learn_logvar: Whether to learn log variance
+            p_prior: Probability of applying equivariance regularization (0 to 1)
+            scale_range: List [min_scale, max_scale] for isotropic scaling (default: [0.25, 1.0])
+            use_rotation: Whether to apply 90-degree rotations
+            equivariance_weight: Weight for equivariance loss component
+        """
+        super().__init__(
+            ddconfig=ddconfig,
+            lossconfig=lossconfig,
+            embed_dim=embed_dim,
+            ckpt_path=ckpt_path,
+            ignore_keys=ignore_keys,
+            image_key=image_key,
+            colorize_nlabels=colorize_nlabels,
+            monitor=monitor,
+            ema_decay=ema_decay,
+            learn_logvar=learn_logvar,
+        )
+
+        # EQ-VAE parameters
+        self.p_prior = p_prior
+        self.scale_range = scale_range if scale_range is not None else [0.25, 1.0]
+        self.use_rotation = use_rotation
+        self.equivariance_weight = equivariance_weight
+
+        # Verify loss is LPIPSWithDiscriminator
+        from ldm.modules.losses import LPIPSWithDiscriminator
+        if not isinstance(self.loss, LPIPSWithDiscriminator):
+            print(f"Warning: EQVAEAutoencoder expects LPIPSWithDiscriminator loss, got {type(self.loss)}")
+
+    def _sample_transformation(self):
+        """
+        Sample random transformation parameters.
+
+        Returns:
+            dict: {
+                'scale': float in [scale_range[0], scale_range[1]],
+                'rotation': int in [0, 1, 2, 3] (multiples of 90 degrees)
+            }
+        """
+        # Sample scale uniformly from range
+        scale = torch.empty(1).uniform_(self.scale_range[0], self.scale_range[1]).item()
+
+        # Sample rotation (0, 90, 180, or 270 degrees)
+        rotation = 0
+        if self.use_rotation:
+            rotation = torch.randint(0, 4, (1,)).item()
+
+        return {'scale': scale, 'rotation': rotation}
+
+    def _transform_latent(self, z, transform_params):
+        """
+        Apply transformation to latent code.
+
+        For scaling: interpolate latent feature map, then pad/crop to maintain shape
+        For rotation: rotate latent feature map by 90-degree multiples
+
+        Args:
+            z: Latent code tensor [B, C, H, W]
+            transform_params: Dict with 'scale' and 'rotation' keys
+
+        Returns:
+            Transformed latent code with same shape as input
+        """
+        z_out = z
+        B, C, H, W = z.shape
+
+        # Apply scaling
+        if transform_params['scale'] != 1.0:
+            new_size = int(H * transform_params['scale'])
+
+            if new_size > 0:  # Ensure valid size
+                # Interpolate to new size
+                z_out = F.interpolate(z_out, size=(new_size, new_size),
+                                      mode='bilinear', align_corners=False)
+
+                # Pad or crop back to original size
+                if new_size < H:
+                    # Pad to original size
+                    pad = (H - new_size) // 2
+                    pad_remainder = (H - new_size) % 2
+                    z_out = F.pad(z_out, (pad, pad + pad_remainder, pad, pad + pad_remainder),
+                                  mode='constant', value=0)
+                elif new_size > H:
+                    # Center crop to original size
+                    start = (new_size - H) // 2
+                    z_out = z_out[:, :, start:start+H, start:start+W]
+
+        # Apply rotation (90-degree multiples)
+        if self.use_rotation and transform_params['rotation'] > 0:
+            z_out = torch.rot90(z_out, k=transform_params['rotation'], dims=[2, 3])
+
+        return z_out
+
+    def _transform_image(self, x, transform_params):
+        """
+        Apply SAME transformation to input image (for target).
+
+        Critical: Must match latent transformation exactly to ensure valid learning signal.
+
+        Args:
+            x: Input image tensor [B, C, H, W]
+            transform_params: Dict with 'scale' and 'rotation' keys
+
+        Returns:
+            Transformed image with same shape as input
+        """
+        x_out = x
+        B, C, H, W = x.shape
+
+        # Apply scaling
+        if transform_params['scale'] != 1.0:
+            new_size = int(H * transform_params['scale'])
+
+            if new_size > 0:  # Ensure valid size
+                # Interpolate to new size
+                x_out = F.interpolate(x_out, size=(new_size, new_size),
+                                      mode='bilinear', align_corners=False)
+
+                # Pad or crop back to original size
+                if new_size < H:
+                    # Pad to original size
+                    pad = (H - new_size) // 2
+                    pad_remainder = (H - new_size) % 2
+                    x_out = F.pad(x_out, (pad, pad + pad_remainder, pad, pad + pad_remainder),
+                                  mode='constant', value=0)
+                elif new_size > H:
+                    # Center crop to original size
+                    start = (new_size - H) // 2
+                    x_out = x_out[:, :, start:start+H, start:start+W]
+
+        # Apply rotation
+        if self.use_rotation and transform_params['rotation'] > 0:
+            x_out = torch.rot90(x_out, k=transform_params['rotation'], dims=[2, 3])
+
+        return x_out
+
+    def _eqvae_forward(self, x):
+        """
+        EQ-VAE forward pass with latent transformations.
+
+        Steps:
+        1. Encode input to latent space
+        2. Sample from posterior
+        3. Apply random transformation to latent code
+        4. Apply SAME transformation to input image (for target comparison)
+        5. Decode transformed latent
+        6. Return reconstruction and posterior
+
+        Args:
+            x: Input images [B, C, H, W]
+
+        Returns:
+            Tuple of (reconstruction, posterior, transformed_input)
+        """
+        # Encode
+        posterior = self.encode(x)
+        z = posterior.sample()
+
+        # Generate random transformation
+        transform_params = self._sample_transformation()
+
+        # Transform latent code
+        z_transformed = self._transform_latent(z, transform_params)
+
+        # Transform input image (for target)
+        x_transformed = self._transform_image(x, transform_params)
+
+        # Decode transformed latent
+        dec = self.decode(z_transformed)
+
+        # Return: reconstruction, posterior, and transformed input (as target)
+        return dec, posterior, x_transformed
+
+    def training_step(self, batch, batch_idx, optimizer_idx=0):
+        """
+        Training step with probabilistic equivariance regularization.
+
+        With probability p_prior, applies EQ-VAE transformations.
+        Otherwise, uses standard VAE training.
+
+        Args:
+            batch: Batch dict with 'image' key
+            batch_idx: Batch index
+            optimizer_idx: 0 for autoencoder, 1 for discriminator
+
+        Returns:
+            Loss tensor
+        """
+        inputs = self.get_input(batch, self.image_key)
+
+        # Decide whether to apply equivariance regularization
+        apply_eqvae = torch.rand(1).item() < self.p_prior
+
+        if optimizer_idx == 0:  # Generator (autoencoder)
+            if apply_eqvae:
+                # EQ-VAE path: encode -> transform latent -> decode
+                reconstructions, posterior, transformed_inputs = self._eqvae_forward(inputs)
+                # Use transformed inputs as target
+                target = transformed_inputs
+            else:
+                # Standard VAE path
+                reconstructions, posterior = self(inputs)
+                target = inputs
+
+            # Compute losses (discriminator will be called internally by loss module)
+            aeloss, log_dict_ae = self.loss(
+                target, reconstructions, posterior, optimizer_idx,
+                self.global_step, last_layer=self.get_last_layer(), split="train"
+            )
+
+            # Add equivariance flag to logging
+            log_dict_ae["train/equivariance_applied"] = float(apply_eqvae)
+
+            self.log_dict(log_dict_ae, prog_bar=False, logger=True,
+                          on_step=True, on_epoch=True)
+
+            self.log("aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=False)
+            return aeloss
+
+        if optimizer_idx == 1:  # Discriminator
+            # Standard forward pass (no transforms for discriminator)
+            reconstructions, posterior = self(inputs)
+
+            discloss, log_dict_disc = self.loss(
+                inputs, reconstructions, posterior, optimizer_idx,
+                self.global_step, last_layer=self.get_last_layer(), split="train"
+            )
+
+            self.log_dict(log_dict_disc, prog_bar=False, logger=True,
+                          on_step=True, on_epoch=True)
+
+            self.log("discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=False)
+            return discloss
+
+    def configure_optimizers(self):
+        """
+        Setup dual optimizers: one for autoencoder, one for discriminator.
+
+        Returns:
+            Tuple of ([opt_ae, opt_disc], [])
+        """
+        lr = self.learning_rate
+
+        # Optimizer 0: Autoencoder (encoder + decoder + quant layers)
+        opt_ae = torch.optim.Adam(
+            list(self.encoder.parameters()) +
+            list(self.decoder.parameters()) +
+            list(self.quant_conv.parameters()) +
+            list(self.post_quant_conv.parameters()),
+            lr=lr, betas=(0.5, 0.9)
+        )
+
+        # Optimizer 1: Discriminator
+        opt_disc = torch.optim.Adam(
+            self.loss.discriminator.parameters(),
+            lr=lr, betas=(0.5, 0.9)
+        )
+
+        return [opt_ae, opt_disc], []
+
+
 class IdentityFirstStage(torch.nn.Module):
     """Identity first stage for compatibility."""
 

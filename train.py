@@ -27,6 +27,7 @@ import wandb
 from data_process.co3d_dataset import jitter_bbox, square_bbox
 from data_process.omniobject_dataset import OmniObjectDataModule
 from data_process.plucker import compute_directions_from_sample, ray_to_plucker
+from ldm.models.autoencoder import AutoencoderKL, PluckerAutoencoder, EQVAEAutoencoder
 from ldm.modules.ema import LitEma
 from ldm.util import instantiate_from_config
 
