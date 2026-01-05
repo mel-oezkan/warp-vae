@@ -57,7 +57,10 @@ class BaseVAETrainer(pl.LightningModule):
         """
         super().__init__()
         self.save_hyperparameters(ignore=['model_config'])
-        
+
+        # Enable manual optimization for dual optimizer support
+        self.automatic_optimization = False
+
         self.learning_rate = learning_rate
         self.image_key = image_key
         self.log_images_every_n_steps = log_images_every_n_steps
@@ -204,72 +207,82 @@ class BaseVAETrainer(pl.LightningModule):
     
     # ==================== Training Steps ====================
     
-    def training_step(self, batch: Dict[str, Any], batch_idx: int, optimizer_idx: int = 0):
+    def training_step(self, batch: Dict[str, Any], batch_idx: int):
         """
-        Execute one training step.
-        
+        Execute one training step with manual optimization.
+
         Uses dual optimizer setup:
-        - optimizer_idx=0: Autoencoder (encoder + decoder)
-        - optimizer_idx=1: Discriminator
-        
+        - opt[0]: Autoencoder (encoder + decoder)
+        - opt[1]: Discriminator
+
         Args:
             batch: Input batch
             batch_idx: Batch index
-            optimizer_idx: Which optimizer to use
-            
+
         Returns:
             Loss tensor
         """
+        opt_ae, opt_disc = self.optimizers()
+
         inputs = self.get_input(batch, self.image_key)
         model_output = self._get_model_output(batch)
-        
+
         # Unpack common outputs
         reconstructions = model_output[0]
         posterior = model_output[1]
-        
-        if optimizer_idx == 0:
-            # Autoencoder loss
-            aeloss, log_dict_ae = self.model.loss(
-                inputs,
-                reconstructions,
-                posterior,
-                optimizer_idx,
-                self.global_step,
-                last_layer=self.get_last_layer(),
-                split="train",
-            )
-            
-            # Add model-specific losses
-            additional_loss, additional_log_dict = self._compute_additional_losses(
-                batch, model_output, split="train"
-            )
-            
-            total_loss = aeloss + additional_loss
-            
-            # Log everything
-            self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            if additional_log_dict:
-                self.log_dict(additional_log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            
-            return total_loss
-        
-        if optimizer_idx == 1:
-            # Discriminator loss
-            discloss, log_dict_disc = self.model.loss(
-                inputs,
-                reconstructions,
-                posterior,
-                optimizer_idx,
-                self.global_step,
-                last_layer=self.get_last_layer(),
-                split="train",
-            )
-            
-            self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            
-            return discloss
+
+        # ========== Optimize Autoencoder ==========
+        # Autoencoder loss
+        aeloss, log_dict_ae = self.model.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            0,  # optimizer_idx for autoencoder
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="train",
+        )
+
+        # Add model-specific losses
+        additional_loss, additional_log_dict = self._compute_additional_losses(
+            batch, model_output, split="train"
+        )
+
+        total_ae_loss = aeloss + additional_loss
+
+        # Optimize autoencoder
+        opt_ae.zero_grad()
+        self.manual_backward(total_ae_loss)
+        opt_ae.step()
+
+        # Log autoencoder losses
+        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        if additional_log_dict:
+            self.log_dict(additional_log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+
+        # ========== Optimize Discriminator ==========
+        # Discriminator loss
+        discloss, log_dict_disc = self.model.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            1,  # optimizer_idx for discriminator
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="train",
+        )
+
+        # Optimize discriminator
+        opt_disc.zero_grad()
+        self.manual_backward(discloss)
+        opt_disc.step()
+
+        # Log discriminator losses
+        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+
+        return total_ae_loss
     
     def validation_step(self, batch: Dict[str, Any], batch_idx: int):
         """
