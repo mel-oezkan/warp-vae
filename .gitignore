@@ -30,3 +30,7 @@ ldm/**/__pycache__/
 checkpoints/
 weights/
 .claude/
+**.pyc
+ldm/__pycache__/util.cpython-310.pyc
+ldm/__pycache__
+lightning_logs/
