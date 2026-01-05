@@ -279,60 +279,73 @@ class EQVAETrainer(BaseVAETrainer):
         
         return reconstructions, posterior
     
-    def training_step(self, batch: Dict[str, Any], batch_idx: int, optimizer_idx: int = 0):
+    def training_step(self, batch: Dict[str, Any], batch_idx: int):
         """
         Training step with equivariance-aware loss computation.
-        
+
         When EQ-VAE is active, the reconstruction target is the transformed input,
         not the original input.
+
+        Uses manual optimization for dual optimizer setup.
         """
+        opt_ae, opt_disc = self.optimizers()
+
         inputs = self.get_input(batch, self.image_key)
         model_output = self._get_model_output(batch)
-        
+
         reconstructions = model_output[0]
         posterior = model_output[1]
-        
+
         # Determine target for reconstruction loss
         if self._use_eqvae_this_step and self._current_transformed_target is not None:
             target = self._current_transformed_target
         else:
             target = inputs
-        
-        if optimizer_idx == 0:
-            # Autoencoder loss (against appropriate target)
-            aeloss, log_dict_ae = self.model.loss(
-                target,  # Use transformed target if EQ-VAE active
-                reconstructions,
-                posterior,
-                optimizer_idx,
-                self.global_step,
-                last_layer=self.get_last_layer(),
-                split="train",
-            )
-            
-            # Log EQ-VAE status
-            self.log("train/eqvae_active", float(self._use_eqvae_this_step))
-            self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            
-            return aeloss
-        
-        if optimizer_idx == 1:
-            # Discriminator loss
-            discloss, log_dict_disc = self.model.loss(
-                target,
-                reconstructions,
-                posterior,
-                optimizer_idx,
-                self.global_step,
-                last_layer=self.get_last_layer(),
-                split="train",
-            )
-            
-            self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            
-            return discloss
+
+        # ========== Optimize Autoencoder ==========
+        # Autoencoder loss (against appropriate target)
+        aeloss, log_dict_ae = self.model.loss(
+            target,  # Use transformed target if EQ-VAE active
+            reconstructions,
+            posterior,
+            0,  # optimizer_idx for autoencoder
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="train",
+        )
+
+        # Optimize autoencoder
+        opt_ae.zero_grad()
+        self.manual_backward(aeloss)
+        opt_ae.step()
+
+        # Log EQ-VAE status
+        self.log("train/eqvae_active", float(self._use_eqvae_this_step))
+        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+
+        # ========== Optimize Discriminator ==========
+        # Discriminator loss
+        discloss, log_dict_disc = self.model.loss(
+            target,
+            reconstructions,
+            posterior,
+            1,  # optimizer_idx for discriminator
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="train",
+        )
+
+        # Optimize discriminator
+        opt_disc.zero_grad()
+        self.manual_backward(discloss)
+        opt_disc.step()
+
+        # Log discriminator losses
+        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
+        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+
+        return aeloss
     
     def _validation_step(
         self,
