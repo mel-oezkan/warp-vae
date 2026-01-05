@@ -37,7 +37,15 @@ def get_vae_weights(input_path):
 def get_device_config():
     n_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))
     devices = torch.cuda.device_count()
-    strategy = "ddp" if n_gpus > 1 else "auto"
+
+    # Use DDP strategy with find_unused_parameters for multi-GPU training
+    # This is needed because EMA buffers are not used in forward pass
+    if devices > 1:
+        from pytorch_lightning.strategies import DDPStrategy
+        strategy = DDPStrategy(find_unused_parameters=True)
+    else:
+        strategy = "auto"
+
     return n_gpus, devices, strategy
 
 
