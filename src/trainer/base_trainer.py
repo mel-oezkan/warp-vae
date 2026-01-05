@@ -14,6 +14,7 @@ from typing import Dict, Any, Optional, Tuple, List
 
 from ldm.util import instantiate_from_config
 from ldm.modules.ema import LitEma
+from src.utils.memory_profiler import MemoryProfiler
 
 
 class BaseVAETrainer(pl.LightningModule):
@@ -72,9 +73,15 @@ class BaseVAETrainer(pl.LightningModule):
         self.use_ema = ema_decay is not None
         if self.use_ema:
             self.ema_decay = ema_decay
-            self.model_ema = LitEma(self.model, decay=ema_decay)
-            print(f"[BaseVAETrainer] Using EMA with decay {ema_decay}")
-        
+            self.model_ema = LitEma(self.model, decay=ema_decay, cpu_offload=True)
+            # Mark EMA buffers as not requiring gradients for DDP compatibility
+            for param in self.model_ema.parameters():
+                param.requires_grad = False
+            print(f"[BaseVAETrainer] Using EMA with decay {ema_decay} (CPU offload enabled)")
+
+        # Initialize memory profiler for tracking GPU memory usage
+        self.memory_profiler = MemoryProfiler()
+
         # Load checkpoint if provided
         if checkpoint_path is not None:
             self.init_from_ckpt(checkpoint_path, ignore_keys)
@@ -256,10 +263,16 @@ class BaseVAETrainer(pl.LightningModule):
         opt_ae.step()
 
         # Log autoencoder losses
-        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-        self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
         if additional_log_dict:
-            self.log_dict(additional_log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+            self.log_dict(additional_log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
+
+        # Log memory usage every 100 steps
+        if batch_idx % 100 == 0:
+            mem_stats = self.memory_profiler.snapshot(f"step_{self.global_step}")
+            self.log("memory/allocated_mb", mem_stats.get('allocated_mb', 0), logger=True, sync_dist=True)
+            self.log("memory/reserved_mb", mem_stats.get('reserved_mb', 0), logger=True, sync_dist=True)
 
         # ========== Optimize Discriminator ==========
         # Discriminator loss
@@ -279,8 +292,8 @@ class BaseVAETrainer(pl.LightningModule):
         opt_disc.step()
 
         # Log discriminator losses
-        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
 
         return total_ae_loss
     
@@ -349,12 +362,12 @@ class BaseVAETrainer(pl.LightningModule):
             batch, model_output, split=f"val{postfix}"
         )
         
-        # Log metrics
-        self.log(f"val{postfix}/rec_loss", log_dict_ae.get(f"val{postfix}/rec_loss", aeloss))
-        self.log_dict(log_dict_ae)
-        self.log_dict(log_dict_disc)
+        # Log metrics (sync_dist=True for proper distributed validation)
+        self.log(f"val{postfix}/rec_loss", log_dict_ae.get(f"val{postfix}/rec_loss", aeloss), sync_dist=True)
+        self.log_dict(log_dict_ae, sync_dist=True)
+        self.log_dict(log_dict_disc, sync_dist=True)
         if additional_log_dict:
-            self.log_dict(additional_log_dict)
+            self.log_dict(additional_log_dict, sync_dist=True)
         
         return {**log_dict_ae, **log_dict_disc, **additional_log_dict}
     
