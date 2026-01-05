@@ -320,9 +320,9 @@ class EQVAETrainer(BaseVAETrainer):
         opt_ae.step()
 
         # Log EQ-VAE status
-        self.log("train/eqvae_active", float(self._use_eqvae_this_step))
-        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-        self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        self.log("train/eqvae_active", float(self._use_eqvae_this_step), sync_dist=True)
+        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
 
         # ========== Optimize Discriminator ==========
         # Discriminator loss
@@ -342,8 +342,8 @@ class EQVAETrainer(BaseVAETrainer):
         opt_disc.step()
 
         # Log discriminator losses
-        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
 
         return aeloss
     
