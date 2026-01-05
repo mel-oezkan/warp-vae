@@ -7,8 +7,8 @@ Provides trainers for different VAE variants:
 - EQVAETrainer: Equivariant VAE
 """
 
-from src.trainers.base_trainer import BaseVAETrainer
-from src.trainers.vae_trainers import (
+from src.trainer.base_trainer import BaseVAETrainer
+from src.trainer.vae_trainers import (
     VanillaVAETrainer,
     PluckerVAETrainer,
     EQVAETrainer,
