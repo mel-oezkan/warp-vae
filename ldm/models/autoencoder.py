@@ -804,19 +804,21 @@ class EQVAEAutoencoder(AutoencoderKL):
         """
         # Encode
         posterior = self.encode(x)
-        z = posterior.sample()
 
-        # Generate random transformation
+        # Sample and immediately transform
+        z = posterior.sample()
         transform_params = self._sample_transformation()
 
         # Transform latent code
         z_transformed = self._transform_latent(z, transform_params)
+        del z  # Free original latent immediately after transformation
 
         # Transform input image (for target)
         x_transformed = self._transform_image(x, transform_params)
 
         # Decode transformed latent
         dec = self.decode(z_transformed)
+        del z_transformed  # Free transformed latent after decode
 
         # Return: reconstruction, posterior, and transformed input (as target)
         return dec, posterior, x_transformed
