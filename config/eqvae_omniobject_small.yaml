@@ -1,3 +1,6 @@
+# Memory-efficient EQ-VAE config for testing on limited GPU memory
+# Reduces model capacity while maintaining architecture
+
 model:
   base_learning_rate: 4.5e-6
   target: ldm.models.autoencoder.EQVAEAutoencoder
@@ -15,11 +18,11 @@ model:
     ddconfig:
       double_z: true
       z_channels: 4
-      resolution: 256
+      resolution: 128               # Reduced from 256
       in_channels: 3
       out_ch: 3
-      ch: 128
-      ch_mult: [1, 2, 4, 4]
+      ch: 64                        # Reduced from 128 (halves model size)
+      ch_mult: [1, 2, 4]            # Reduced from [1, 2, 4, 4] (removes deepest layer)
       num_res_blocks: 2
       attn_resolutions: []
       dropout: 0.0
@@ -32,7 +35,7 @@ model:
         disc_weight: 0.5            # Discriminator loss weight
         perceptual_weight: 1.0      # LPIPS perceptual loss weight
         disc_in_channels: 3
-        disc_num_layers: 3
+        disc_num_layers: 2          # Reduced from 3 (smaller discriminator)
         use_actnorm: false
 
 trainer:
@@ -45,10 +48,10 @@ data:
       type: omniobject
       params:
         root_dir: "/data/lab_moezkan/omni_obj/blender_renders_24_views"
-        image_size: 256
+        image_size: 128             # Reduced from 256
         include_plucker: false
-        sample_mode: single        # EQ-VAE uses single views with transforms
-    batch_size: 4
+        sample_mode: single         # EQ-VAE uses single views with transforms
+    batch_size: 4                   # Can now use larger batch
     val_split: 0.1
     num_workers: 8
     pin_memory: true
@@ -57,7 +60,7 @@ data:
 
 training:
   batch_size: 4
-  image_size: 256
+  image_size: 128
   num_workers: 8
   val_size: 0.1
   num_epochs: 100
@@ -67,11 +70,13 @@ training:
   plucker_loss_weight: 0.0         # Not used in EQ-VAE
   ema_decay: 0.9999
   precision: 16
-  output_dir: "./outputs/eqvae"
-  note: "EQ-VAE with OmniObject dataset"
+  output_dir: "./outputs/eqvae_small"
+  note: "EQ-VAE small model for GPU memory testing"
+  checkpoint_every_n_epochs: 1     # Save more frequently for testing
+  log_every_n_steps: 10            # Log more frequently for testing
 
 wandb:
-  enabled: true
+  enabled: false                    # Disable for testing
   project: enhanced-VAE
   entity: deep_cv
-  tags: ["eqvae", "equivariance", "omniobject"]
+  tags: ["eqvae", "equivariance", "omniobject", "small-model"]
