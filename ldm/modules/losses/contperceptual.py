@@ -15,6 +15,9 @@ class LPIPSWithDiscriminator(nn.Module):
         self.kl_weight = kl_weight
         self.pixel_weight = pixelloss_weight
         self.perceptual_loss = LPIPS().eval()
+        # Freeze LPIPS parameters to prevent gradient computation and save memory
+        for param in self.perceptual_loss.parameters():
+            param.requires_grad = False
         self.perceptual_weight = perceptual_weight
         # output log variance
         self.logvar = nn.Parameter(torch.ones(size=()) * logvar_init)
@@ -30,14 +33,33 @@ class LPIPSWithDiscriminator(nn.Module):
         self.disc_conditional = disc_conditional
 
     def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
-        if last_layer is not None:
-            nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
-            g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
-        else:
-            nll_grads = torch.autograd.grad(nll_loss, self.last_layer[0], retain_graph=True)[0]
-            g_grads = torch.autograd.grad(g_loss, self.last_layer[0], retain_graph=True)[0]
+        """
+        Calculate adaptive weight with optimized memory usage.
 
-        d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
+        Uses create_graph=False to avoid building computation graphs for gradients.
+        Must retain graph since this is called during forward pass.
+        """
+        if last_layer is not None:
+            target_layer = last_layer
+        else:
+            target_layer = self.last_layer[0]
+
+        # Compute gradients separately with create_graph=False to save memory
+        # Must use retain_graph=True for both since we're inside the forward pass
+        nll_grads = torch.autograd.grad(
+            nll_loss, target_layer,
+            retain_graph=True,
+            create_graph=False   # Don't build graph for gradient itself - saves memory
+        )[0]
+
+        g_grads = torch.autograd.grad(
+            g_loss, target_layer,
+            retain_graph=True,
+            create_graph=False   
+        )[0]
+
+        # Compute weight with detached gradients
+        d_weight = torch.norm(nll_grads.detach()) / (torch.norm(g_grads.detach()) + 1e-4)
         d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
         d_weight = d_weight * self.discriminator_weight
         return d_weight
@@ -45,17 +67,21 @@ class LPIPSWithDiscriminator(nn.Module):
     def forward(self, inputs, reconstructions, posteriors, optimizer_idx,
                 global_step, last_layer=None, cond=None, split="train",
                 weights=None):
+        # Reconstruction loss - AMP will handle precision automatically
         rec_loss = torch.abs(inputs.contiguous() - reconstructions.contiguous())
         if self.perceptual_weight > 0:
             p_loss = self.perceptual_loss(inputs.contiguous(), reconstructions.contiguous())
             rec_loss = rec_loss + self.perceptual_weight * p_loss
 
-        nll_loss = rec_loss / torch.exp(self.logvar) + self.logvar
+        # Keep logvar computation in FP32 for stability with very small values
+        nll_loss = rec_loss / torch.exp(self.logvar.float()) + self.logvar.float()
         weighted_nll_loss = nll_loss
         if weights is not None:
             weighted_nll_loss = weights*nll_loss
         weighted_nll_loss = torch.sum(weighted_nll_loss) / weighted_nll_loss.shape[0]
         nll_loss = torch.sum(nll_loss) / nll_loss.shape[0]
+
+        # KL loss - let AMP handle precision, weight is very small (0.000001)
         kl_loss = posteriors.kl()
         kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]
 
