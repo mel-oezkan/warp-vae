@@ -1,7 +1,5 @@
 # Quick Start Guide - Modular VAE Training
 
-> **✅ Migration Complete!** The training pipeline has been successfully migrated to a modular architecture with manual optimization support. All models (Vanilla VAE, Plucker VAE, EQ-VAE) are now working with the new system.
-
 ## Installation
 
 1. **Activate environment**:
@@ -288,14 +286,6 @@ CUDA_VISIBLE_DEVICES=0 python train.py --config-name=plucker_vae_co3d
 
 **Note**: Gradient accumulation is **not compatible** with manual optimization (used for dual optimizer setup). Use smaller batch sizes instead.
 
-### Data Loading Too Slow
-
-Increase workers:
-```bash
-python train.py --config-name=vanilla_vae_co3d \
-    data.params.num_workers=8
-```
-
 ### Check Configuration
 
 Print resolved config:
@@ -308,32 +298,6 @@ print(OmegaConf.to_yaml(cfg, resolve=True))
 ```
 
 ---
-
-## GPU Memory Guide
-
-### Memory Requirements by Configuration
-
-| Config | Model Size | Image Size | Batch Size | GPU Memory | Training Speed |
-|--------|-----------|------------|------------|------------|----------------|
-| `eqvae_omniobject_small` | ch=64, 3 layers | 128×128 | 4 | ~2.6 GB | ~3.7 it/s |
-| `eqvae_omniobject` | ch=128, 4 layers | 256×256 | 4 | ~10.4 GB | ~1.2 it/s |
-| `plucker_vae_co3d` | ch=128, 4 layers | 256×256 | 4 | ~10.4 GB | ~1.2 it/s |
-| `vanilla_vae_co3d` | ch=128, 4 layers | 256×256 | 8 | ~15 GB | ~2.0 it/s |
-
-### Optimizing for Your GPU
-
-**11GB GPU (GTX 1080 Ti, RTX 2080 Ti)**:
-- Use `eqvae_omniobject_small` config
-- Or reduce ch to 64-80 in other configs
-- Use batch_size=2-4
-
-**24GB GPU (RTX 3090, RTX 4090, A5000)**:
-- All configs work with default settings
-- Can increase batch size for faster training
-
-**16GB GPU (RTX 4000, A4000)**:
-- Use ch=96 as compromise
-- batch_size=4-6 works well
 
 **Memory Calculation**:
 ```
@@ -420,22 +384,84 @@ Approximate GPU Memory = Base Model + (Batch Size × Image Memory)
 
 ---
 
-## Recent Updates
+## Recommended Next Steps
 
-### ✅ January 2026 - Manual Optimization & GPU Memory Fixes
+### Immediate Actions (High Impact, Quick Wins)
 
-**What was fixed**:
-1. **Manual Optimization**: Fixed PyTorch Lightning dual optimizer support
-   - Updated [src/trainer/base_trainer.py](src/trainer/base_trainer.py) with `automatic_optimization = False`
-   - Rewrote training steps to use `opt_ae, opt_disc = self.optimizers()`
-2. **GPU Memory Issues**: Created memory-efficient configuration
-   - Added [config/eqvae_omniobject_small.yaml](config/eqvae_omniobject_small.yaml)
-   - Reduced model from 10.4GB to 2.6GB GPU memory usage
-3. **Testing**: Verified end-to-end training on OmniObject3D dataset
-   - 141,840 samples successfully loaded
-   - Training runs at ~3.7 it/s on GTX 1080 Ti
+**1. Hyperparameter Tuning**
+```bash
+# Increase KL weight for better latent regularization
+python train.py --config-name=eqvae_omniobject_small \
+    training.kl_weight=0.00001 \
+    training.num_epochs=50 \
+    training.note="increased-kl-weight"
+```
 
-**Migration Status**: ✅ Complete and tested
+**2. Train Full-Scale Model**
+```bash
+# Now that small model works, scale up for better quality
+python train.py --config-name=eqvae_omniobject \
+    training.num_epochs=100 \
+    training.checkpoint_every_n_epochs=5
+```
+
+**3. Compare VAE Variants**
+```bash
+# Run all three variants on same data
+python train.py --config-name=vanilla_vae_co3d training.num_epochs=50
+python train.py --config-name=plucker_vae_co3d training.num_epochs=50
+python train.py --config-name=eqvae_omniobject training.num_epochs=50
+```
+
+### Medium-Term Improvements
+
+**4. Add Learning Rate Scheduling**
+- Implement cosine annealing or reduce-on-plateau
+- Expected: Better final convergence, escape local minima
+- See: [feature-backlog/(2)eqvae-future-features.md](feature-backlog/(2)eqvae-future-features.md) section 9
+
+**5. Implement Prior Preservation Mode**
+- Add `p_prior_s` parameter for random downscaling-only mode
+- Helps prevent posterior collapse and maintain latent distributions
+- See: [feature-backlog/(2)eqvae-future-features.md](feature-backlog/(2)eqvae-future-features.md) section 4
+
+**6. Extended Training**
+- Current: 10 epochs (discriminator barely started at 50k steps)
+- Recommended: 50-100 epochs for full convergence
+- Monitor: Equivariance error should decrease, FID should improve
+
+### Long-Term Research Direction (High Value)
+
+**7. Real Camera Transformations** ⭐ **MOST IMPORTANT**
+
+Current limitation: Using synthetic 2D transformations (scaling, rotation)
+
+**Goal**: Use actual camera poses from OmniObject dataset for true 3D equivariance
+
+**Implementation approach**:
+```bash
+# Phase 1: Enable paired view training
+python train.py --config-name=eqvae_omniobject \
+    data.params.dataset_config.params.sample_mode=pairs \
+    data.params.dataset_config.params.pair_sampling=sequential \
+    model.params.use_camera_transforms=true
+```
+
+**Required changes**:
+1. Implement learnable 3D transformation module (R, T → latent transform)
+2. Add multi-view consistency loss
+3. Train with view pairs from OmniObject
+4. Evaluate on novel view synthesis
+
+See detailed plan: [feature-backlog/(2)eqvae-future-features.md](feature-backlog/(2)eqvae-future-features.md) section 3
+
+**8. Ablation Studies**
+- Vary `p_prior` (0.5, 0.7, 0.9, 1.0)
+- Vary `scale_range` ([0.5, 1.0], [0.25, 1.0], [0.1, 1.0])
+- Vary `equivariance_weight` (0.5, 1.0, 2.0)
+- Test with/without rotations
+- Compare synthetic vs real camera transforms
+
 
 ---
 
@@ -443,8 +469,10 @@ Approximate GPU Memory = Base Model + (Batch Size × Image Memory)
 
 - **Implementation Details**: See [MIGRATION_COMPLETE.md](MIGRATION_COMPLETE.md)
 - **Detailed Plan**: See [feature-backlog/(4)modular-migration.md](feature-backlog/(4)modular-migration.md)
+- **Future Features**: See [feature-backlog/(2)eqvae-future-features.md](feature-backlog/(2)eqvae-future-features.md)
 - **Issues**: Check console warnings and error messages
 - **GPU Memory Problems**: See "GPU Memory Guide" section above
+- **Evaluation Results**: See [evaluation_outputs/](evaluation_outputs/)
 
 ---
 
