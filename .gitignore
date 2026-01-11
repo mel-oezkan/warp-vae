@@ -36,3 +36,4 @@ ldm/__pycache__
 lightning_logs/evaluation_outputs/
 lightning_logs/
 evaluation_outputs/
+*.ipynb
