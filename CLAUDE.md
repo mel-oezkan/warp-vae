@@ -4,3 +4,5 @@ As baseline we use the stable diffusion VAEs and iterate on it using different i
 
 # Python Environment
 - conda activate cv (project environment)
+
+Get a idea about the code by looking at the quickstart file in feature-backlog/QUICKSTART.md and then proceed with your implementation
