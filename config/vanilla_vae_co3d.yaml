@@ -52,7 +52,7 @@ data:
     shuffle_train: true
 
 # Data paths (override these in command line or environment)
-co3d_dir: "/data/lab_moezkan/co3d_full"
+co3d_dir: "/data/lab_moezkan/co3d_full/toybus"
 bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
 
 # Optional: Path to pretrained weights (e.g., Stable Diffusion checkpoint)

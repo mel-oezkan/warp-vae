@@ -7,7 +7,7 @@ import yaml
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from tqdm import tqdm
 
 from ldm.util import instantiate_from_config
@@ -120,7 +120,7 @@ class EQVAEEvaluator:
         if unexpected_keys:
             print(f"  Warning: Unexpected keys: {len(unexpected_keys)}")
 
-        print(f"✓ Checkpoint loaded")
+        print("✓ Checkpoint loaded")
 
         # Move to device and set to eval mode
         model = model.to(self.device)
@@ -128,7 +128,7 @@ class EQVAEEvaluator:
 
         # Use EMA weights if available
         if self.use_ema and hasattr(model, 'model_ema') and model.model_ema is not None:
-            print(f"✓ Using EMA weights")
+            print("✓ Using EMA weights")
             self.model = model
             self._ema_mode = True
         else:
@@ -175,7 +175,7 @@ class EQVAEEvaluator:
         # Get dataloader
         if split == 'val':
             self.val_loader = self.datamodule.val_dataloader()
-            print(f"✓ Validation dataloader ready")
+            print("✓ Validation dataloader ready")
             print(f"  Validation samples: {len(self.datamodule.val_dataset)}")
             print(f"  Batches: {len(self.val_loader)}")
             print(f"  Batch size: {self.batch_size}")
@@ -373,53 +373,53 @@ class EQVAEEvaluator:
         report_path = self.reports_dir / "validation_report.md"
 
         with open(report_path, 'w') as f:
-            f.write(f"# EQVAE Validation Report\n\n")
+            f.write("# EQVAE Validation Report\n\n")
             f.write(f"**Date:** {metrics['timestamp']}\n\n")
             f.write(f"**Checkpoint:** `{metrics['checkpoint']}`\n\n")
             f.write(f"**Epoch:** {metrics['epoch']}\n\n")
             f.write(f"**Use EMA:** {metrics['use_ema']}\n\n")
-            f.write(f"---\n\n")
+            f.write("---\n\n")
 
             # Reconstruction quality
-            f.write(f"## Reconstruction Quality\n\n")
+            f.write("## Reconstruction Quality\n\n")
             if 'reconstruction_quality' in metrics:
                 for k, v in metrics['reconstruction_quality'].items():
                     f.write(f"- **{k.upper()}:** {v:.4f}\n")
-            f.write(f"\n")
+            f.write("\n")
 
             # LPIPS
             if 'lpips' in metrics and metrics['lpips']:
-                f.write(f"## LPIPS Perceptual Similarity\n\n")
+                f.write("## LPIPS Perceptual Similarity\n\n")
                 f.write(f"- **Mean:** {metrics['lpips']['mean']:.4f}\n")
                 f.write(f"- **Std:** {metrics['lpips']['std']:.4f}\n")
-                f.write(f"\n")
+                f.write("\n")
 
             # FID
             if 'fid' in metrics and metrics['fid'] is not None:
-                f.write(f"## FID Score\n\n")
+                f.write("## FID Score\n\n")
                 f.write(f"- **FID:** {metrics['fid']:.2f}\n")
-                f.write(f"\n")
+                f.write("\n")
 
             # Equivariance
             if 'equivariance' in metrics:
-                f.write(f"## Equivariance Properties\n\n")
+                f.write("## Equivariance Properties\n\n")
                 f.write(f"```json\n{json.dumps(metrics['equivariance'], indent=2)}\n```\n\n")
 
             # Latent space
             if 'latent_space' in metrics:
-                f.write(f"## Latent Space Statistics\n\n")
+                f.write("## Latent Space Statistics\n\n")
                 f.write(f"- **KL Divergence:** {metrics['latent_space']['kl_divergence']:.4f}\n")
                 f.write(f"- **Sparsity Ratio:** {metrics['latent_space']['sparsity_ratio']:.4f}\n")
-                f.write(f"\n")
+                f.write("\n")
 
             # Figures
-            f.write(f"## Figures\n\n")
-            f.write(f"- [Reconstruction Grid](../figures/reconstruction_grid.pdf)\n")
-            f.write(f"- [Equivariance Tests](../figures/equivariance_tests.pdf)\n")
-            f.write(f"- [Latent t-SNE](../figures/latent_tsne.pdf)\n")
-            f.write(f"- [Latent Distributions](../figures/latent_distributions.pdf)\n")
-            f.write(f"- [Interpolations](../figures/interpolations.pdf)\n")
-            f.write(f"- [Multi-View Consistency](../figures/multiview_consistency.pdf)\n")
+            f.write("## Figures\n\n")
+            f.write("- [Reconstruction Grid](../figures/reconstruction_grid.pdf)\n")
+            f.write("- [Equivariance Tests](../figures/equivariance_tests.pdf)\n")
+            f.write("- [Latent t-SNE](../figures/latent_tsne.pdf)\n")
+            f.write("- [Latent Distributions](../figures/latent_distributions.pdf)\n")
+            f.write("- [Interpolations](../figures/interpolations.pdf)\n")
+            f.write("- [Multi-View Consistency](../figures/multiview_consistency.pdf)\n")
 
         print(f"✓ Report saved to: {report_path}")
 
