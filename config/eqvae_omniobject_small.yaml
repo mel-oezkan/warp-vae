@@ -10,7 +10,7 @@ model:
     image_key: "image"
 
     # EQ-VAE specific parameters
-    p_prior: 0.9                    # Probability of applying equivariance regularization
+    p_prior: 0.5                    # Probability of applying equivariance regularization
     scale_range: [0.25, 1.0]        # Isotropic scaling range (0.25x to 1.0x)
     use_rotation: true              # Enable 90-degree rotations
     equivariance_weight: 1.0        # Weight for equivariance loss term
@@ -59,24 +59,24 @@ data:
     shuffle_train: true
 
 training:
-  batch_size: 4
+  batch_size: 8
   image_size: 128
   num_workers: 8
   val_size: 0.1
-  num_epochs: 100
+  num_epochs: 20
   lr: 4.5e-6
   kl_weight: 0.000001
-  lpips_loss_weight: 1.0
+  lpips_loss_weight: 3.0
   plucker_loss_weight: 0.0         # Not used in EQ-VAE
   ema_decay: 0.9999
   precision: 16
   output_dir: "./outputs/eqvae_small"
-  note: "EQ-VAE small model for GPU memory testing"
+  note: "Hyperarameter"
   checkpoint_every_n_epochs: 1     # Save more frequently for testing
   log_every_n_steps: 10            # Log more frequently for testing
 
 wandb:
-  enabled: false                    # Disable for testing
+  enabled: true                    # Disable for testing
   project: enhanced-VAE
   entity: deep_cv
   tags: ["eqvae", "equivariance", "omniobject", "small-model"]
