@@ -1,0 +1,89 @@
+# Warp VAE configuration for CO3D dataset
+# Uses RoMaV2 dense correspondences for multi-view consistency training
+
+model:
+  base_learning_rate: 4.5e-6
+  target: ldm.models.autoencoder.AutoencoderKL
+  params:
+    embed_dim: 4
+    monitor: val/rec_loss
+    image_key: "image"
+
+    ddconfig:
+      double_z: true
+      z_channels: 4
+      resolution: 256
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult: [1, 2, 4, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 50001
+        kl_weight: 0.000001
+        disc_weight: 0.5
+        perceptual_weight: 1.0
+        disc_in_channels: 3
+        disc_num_layers: 3
+        use_actnorm: false
+
+trainer:
+  target: src.trainer.vae_trainers.WarpVAETrainer
+  params:
+    # Warp-specific parameters
+    target_key: "image_target"
+    warp_consistency_weight: 0.5          # Weight for latent space consistency
+    warp_reconstruction_weight: 0.0       # Weight for image-space warp loss (optional)
+    consistency_loss_type: "l1"           # "l1", "l2", "cosine", or "combined"
+    bidirectional: true                   # Compute loss in both A->B and B->A
+    confidence_weighted: true             # Weight by RoMaV2 confidence
+    confidence_threshold: 0.1             # Minimum confidence threshold
+    warmup_steps: 5000                    # Steps before full warp loss weight
+
+data:
+  target: src.data.datamodule.VAEDataModule
+  params:
+    dataset_config:
+      type: warp_co3d
+      params:
+        root_dir: "/data/lab_moezkan/co3d_full"
+        bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
+        image_size: 256
+        romav2_setting: "turbo"           # "turbo" (fast, ~8GB), "fast", "base", "precise"
+        pair_sampling: "random"           # "random", "sequential", "fixed"
+        max_pair_distance: 20             # Maximum frame distance for pairs
+        warp_resolution: 256              # Resolution for warp field
+        confidence_threshold: 0.5         # Confidence threshold for valid warps
+        include_plucker: false
+    batch_size: 2                         # Small batch due to paired data + RoMaV2
+    val_split: 0.1
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    shuffle_train: true
+
+training:
+  batch_size: 2
+  image_size: 256
+  num_workers: 4
+  val_size: 0.1
+  num_epochs: 50
+  lr: 4.5e-6
+  kl_weight: 0.000001
+  lpips_loss_weight: 1.0
+  ema_decay: 0.9999
+  precision: 16
+  output_dir: "./outputs/warp_vae_co3d"
+  checkpoint_every_n_epochs: 5
+  log_every_n_steps: 50
+
+wandb:
+  enabled: true
+  project: enhanced-VAE
+  entity: deep_cv
+  tags: ["warp-vae", "romav2", "co3d", "multi-view-consistency"]
