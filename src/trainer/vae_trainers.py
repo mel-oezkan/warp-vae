@@ -5,6 +5,7 @@ Each trainer extends BaseVAETrainer with model-specific functionality:
 - VanillaVAETrainer: Standard AutoencoderKL
 - PluckerVAETrainer: PluckerAutoencoder with Plucker loss
 - EQVAETrainer: EQVAEAutoencoder with equivariance regularization
+- WarpVAETrainer: VAE with multi-view consistency via RoMaV2 warps
 """
 
 import torch
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 from typing import Dict, Any, Tuple, List, Optional
 
 from src.trainer.base_trainer import BaseVAETrainer
+from src.losses.warp_consistency import WarpConsistencyLoss, WarpReconstructionLoss
 
 
 class VanillaVAETrainer(BaseVAETrainer):
@@ -373,5 +375,388 @@ class EQVAETrainer(BaseVAETrainer):
         log = {}
         if self._current_transformed_target is not None:
             log["transformed_target"] = self._current_transformed_target
+
+        return log
+
+
+class WarpVAETrainer(BaseVAETrainer):
+    """
+    Trainer for VAE with multi-view consistency via RoMaV2 warps.
+
+    Extends base training with:
+    - Paired image processing (source and target views)
+    - Latent space warp consistency loss
+    - Optional image-space warp reconstruction loss
+    - Bidirectional warp supervision
+
+    The key idea is that the latent representations of corresponding
+    pixels across views (as determined by RoMaV2 dense correspondences)
+    should be similar, encouraging the VAE to learn 3D-aware features.
+    """
+
+    def __init__(
+        self,
+        model_config: Dict[str, Any],
+        learning_rate: float = 4.5e-6,
+        ema_decay: Optional[float] = None,
+        image_key: str = "image",
+        target_key: str = "image_target",
+        log_images_every_n_steps: int = 500,
+        checkpoint_path: Optional[str] = None,
+        ignore_keys: List[str] = [],
+        # Warp-specific parameters
+        warp_consistency_weight: float = 1.0,
+        warp_reconstruction_weight: float = 0.0,
+        consistency_loss_type: str = "l1",
+        bidirectional: bool = True,
+        confidence_weighted: bool = True,
+        confidence_threshold: float = 0.1,
+        warmup_steps: int = 0,
+    ):
+        """
+        Initialize Warp VAE trainer.
+
+        Args:
+            model_config: Config for AutoencoderKL instantiation
+            learning_rate: Learning rate for optimizers
+            ema_decay: EMA decay rate (None to disable)
+            image_key: Key for source images in batch
+            target_key: Key for target images in batch
+            log_images_every_n_steps: Image logging frequency
+            checkpoint_path: Path to pretrained checkpoint
+            ignore_keys: Keys to ignore when loading checkpoint
+            warp_consistency_weight: Weight for latent consistency loss
+            warp_reconstruction_weight: Weight for image-space warp loss
+            consistency_loss_type: Type of consistency loss ("l1", "l2", "cosine")
+            bidirectional: Compute loss in both directions (A->B and B->A)
+            confidence_weighted: Weight loss by RoMaV2 confidence
+            confidence_threshold: Minimum confidence for loss computation
+            warmup_steps: Steps before enabling warp loss (for stability)
+        """
+        super().__init__(
+            model_config=model_config,
+            learning_rate=learning_rate,
+            ema_decay=ema_decay,
+            image_key=image_key,
+            log_images_every_n_steps=log_images_every_n_steps,
+            checkpoint_path=checkpoint_path,
+            ignore_keys=ignore_keys,
+        )
+
+        self.target_key = target_key
+        self.warp_consistency_weight = warp_consistency_weight
+        self.warp_reconstruction_weight = warp_reconstruction_weight
+        self.warmup_steps = warmup_steps
+
+        # Initialize warp consistency loss
+        self.warp_consistency_loss = WarpConsistencyLoss(
+            loss_type=consistency_loss_type,
+            bidirectional=bidirectional,
+            confidence_weighted=confidence_weighted,
+            confidence_threshold=confidence_threshold,
+        )
+
+        # Optional warp reconstruction loss
+        if warp_reconstruction_weight > 0:
+            self.warp_reconstruction_loss = WarpReconstructionLoss(
+                loss_type="l1",
+                confidence_weighted=confidence_weighted,
+            )
+        else:
+            self.warp_reconstruction_loss = None
+
+        print("[WarpVAETrainer] Initialized with:")
+        print(f"  - warp_consistency_weight={warp_consistency_weight}")
+        print(f"  - warp_reconstruction_weight={warp_reconstruction_weight}")
+        print(f"  - consistency_loss_type={consistency_loss_type}")
+        print(f"  - bidirectional={bidirectional}")
+        print(f"  - warmup_steps={warmup_steps}")
+
+    def _get_model_output(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Any]:
+        """
+        Get model output for source image.
+
+        Returns:
+            Tuple of (reconstructions, posterior)
+        """
+        inputs = self.get_input(batch, self.image_key)
+        reconstructions, posterior = self.model(inputs, sample_posterior=True)
+        return reconstructions, posterior
+
+    def _get_target_encoding(self, batch: Dict[str, Any]) -> torch.Tensor:
+        """
+        Encode target image to latent space.
+
+        Returns:
+            Latent code for target image (B, C, H, W)
+        """
+        target = self.get_input(batch, self.target_key)
+        posterior = self.model.encode(target)
+        return posterior.sample()
+
+    def _compute_warp_losses(
+        self,
+        batch: Dict[str, Any],
+        latent_a: torch.Tensor,
+        latent_b: torch.Tensor,
+        recon_a: torch.Tensor,
+        split: str = "train"
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute warp-based consistency losses.
+
+        Args:
+            batch: Input batch with warp fields
+            latent_a: Latent code for source image
+            latent_b: Latent code for target image
+            recon_a: Reconstruction of source image
+            split: "train" or "val" for logging
+
+        Returns:
+            Tuple of (total_warp_loss, log_dict)
+        """
+        # Extract warp fields from batch
+        warp_ab = batch["warp_ab"].to(latent_a.device)
+        warp_ba = batch["warp_ba"].to(latent_a.device)
+        conf_ab = batch.get("confidence_ab")
+        conf_ba = batch.get("confidence_ba")
+
+        if conf_ab is not None:
+            conf_ab = conf_ab.to(latent_a.device)
+        if conf_ba is not None:
+            conf_ba = conf_ba.to(latent_a.device)
+
+        log_dict = {}
+        total_loss = torch.tensor(0.0, device=latent_a.device)
+
+        # Check warmup
+        warp_factor = 1.0
+        if self.warmup_steps > 0 and self.global_step < self.warmup_steps:
+            warp_factor = self.global_step / self.warmup_steps
+
+        # Latent consistency loss
+        if self.warp_consistency_weight > 0:
+            consistency_result = self.warp_consistency_loss(
+                latent_a, latent_b,
+                warp_ab, warp_ba,
+                conf_ab, conf_ba
+            )
+
+            consistency_loss = consistency_result["loss"]
+            weighted_consistency = self.warp_consistency_weight * warp_factor * consistency_loss
+            total_loss = total_loss + weighted_consistency
+
+            log_dict[f"{split}/warp_consistency_loss"] = consistency_loss.detach()
+            log_dict[f"{split}/warp_consistency_weighted"] = weighted_consistency.detach()
+
+            if "loss_ab" in consistency_result:
+                log_dict[f"{split}/warp_consistency_ab"] = consistency_result["loss_ab"].detach()
+            if "loss_ba" in consistency_result:
+                log_dict[f"{split}/warp_consistency_ba"] = consistency_result["loss_ba"].detach()
+
+        # Image-space warp reconstruction loss
+        if self.warp_reconstruction_loss is not None and self.warp_reconstruction_weight > 0:
+            target_img = self.get_input(batch, self.target_key)
+
+            recon_result = self.warp_reconstruction_loss(
+                recon_a, target_img, warp_ab, conf_ab
+            )
+
+            recon_loss = recon_result["loss"]
+            weighted_recon = self.warp_reconstruction_weight * warp_factor * recon_loss
+            total_loss = total_loss + weighted_recon
+
+            log_dict[f"{split}/warp_recon_loss"] = recon_loss.detach()
+            log_dict[f"{split}/warp_recon_weighted"] = weighted_recon.detach()
+
+        log_dict[f"{split}/warp_factor"] = torch.tensor(warp_factor, device=latent_a.device)
+
+        return total_loss, log_dict
+
+    def training_step(self, batch: Dict[str, Any], batch_idx: int):
+        """
+        Training step with warp consistency.
+
+        Processes paired images and enforces latent space consistency
+        across views using RoMaV2 correspondences.
+        """
+        opt_ae, opt_disc = self.optimizers()
+
+        # Get source image and encoding
+        inputs = self.get_input(batch, self.image_key)
+        reconstructions, posterior = self.model(inputs, sample_posterior=True)
+        latent_a = posterior.sample()
+
+        # Get target encoding
+        latent_b = self._get_target_encoding(batch)
+
+        # ========== Optimize Autoencoder ==========
+        # Standard reconstruction loss
+        aeloss, log_dict_ae = self.model.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            0,  # optimizer_idx for autoencoder
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="train",
+        )
+
+        # Warp consistency loss
+        warp_loss, warp_log_dict = self._compute_warp_losses(
+            batch, latent_a, latent_b, reconstructions, split="train"
+        )
+
+        total_ae_loss = aeloss + warp_loss
+
+        # Optimize autoencoder
+        opt_ae.zero_grad()
+        self.manual_backward(total_ae_loss)
+        opt_ae.step()
+
+        # Log losses
+        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        self.log("train/warp_loss", warp_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        self.log("train/total_ae_loss", total_ae_loss, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        # Filter out total_loss from log_dict_ae to avoid duplicate logging
+        log_dict_ae_filtered = {k: v for k, v in log_dict_ae.items() if "total_loss" not in k}
+        self.log_dict(log_dict_ae_filtered, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
+        self.log_dict(warp_log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
+
+        # Log memory usage periodically
+        if batch_idx % 100 == 0:
+            mem_stats = self.memory_profiler.snapshot(f"step_{self.global_step}")
+            self.log("memory/allocated_mb", mem_stats.get('allocated_mb', 0), logger=True, sync_dist=False)
+
+        # ========== Optimize Discriminator ==========
+        discloss, log_dict_disc = self.model.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            1,  # optimizer_idx for discriminator
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split="train",
+        )
+
+        opt_disc.zero_grad()
+        self.manual_backward(discloss)
+        opt_disc.step()
+
+        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
+
+        return total_ae_loss
+
+    def _validation_step(
+        self,
+        batch: Dict[str, Any],
+        batch_idx: int,
+        postfix: str = ""
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Validation step with warp consistency metrics.
+        """
+        inputs = self.get_input(batch, self.image_key)
+        reconstructions, posterior = self.model(inputs, sample_posterior=True)
+        latent_a = posterior.sample()
+
+        # Get target encoding
+        latent_b = self._get_target_encoding(batch)
+
+        # Standard losses
+        aeloss, log_dict_ae = self.model.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            0,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split=f"val{postfix}",
+        )
+
+        discloss, log_dict_disc = self.model.loss(
+            inputs,
+            reconstructions,
+            posterior,
+            1,
+            self.global_step,
+            last_layer=self.get_last_layer(),
+            split=f"val{postfix}",
+        )
+
+        # Warp consistency loss
+        warp_loss, warp_log_dict = self._compute_warp_losses(
+            batch, latent_a, latent_b, reconstructions, split=f"val{postfix}"
+        )
+
+        # Log metrics
+        self.log(f"val{postfix}/rec_loss", log_dict_ae.get(f"val{postfix}/rec_loss", aeloss), sync_dist=True)
+        self.log(f"val{postfix}/warp_loss", warp_loss, sync_dist=True)
+        self.log_dict(log_dict_ae, sync_dist=True)
+        self.log_dict(log_dict_disc, sync_dist=True)
+        self.log_dict(warp_log_dict, sync_dist=True)
+
+        return {**log_dict_ae, **log_dict_disc, **warp_log_dict}
+
+    @torch.no_grad()
+    def log_images(
+        self,
+        batch: Dict[str, Any],
+        only_inputs: bool = False,
+        **kwargs
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Generate images for logging, including warped visualizations.
+        """
+        log = {}
+
+        # Source image
+        inputs = self.get_input(batch, self.image_key)
+        log["source"] = inputs
+
+        # Target image
+        if self.target_key in batch:
+            target = self.get_input(batch, self.target_key)
+            log["target"] = target
+
+        if not only_inputs:
+            # Reconstruction
+            reconstructions, posterior = self.model(inputs, sample_posterior=True)
+            log["reconstruction"] = reconstructions
+
+            # Warp visualization if available
+            if "warp_ab" in batch:
+                warp_ab = batch["warp_ab"].to(inputs.device)
+
+                # Resize warp to image resolution
+                H, W = inputs.shape[2:]
+                if warp_ab.shape[1] != H:
+                    warp_ab = F.interpolate(
+                        warp_ab.permute(0, 3, 1, 2),
+                        size=(H, W),
+                        mode="bilinear",
+                        align_corners=False
+                    ).permute(0, 2, 3, 1)
+
+                # Warp source to target view
+                warped_source = F.grid_sample(
+                    inputs,
+                    warp_ab,
+                    mode="bilinear",
+                    padding_mode="border",
+                    align_corners=False
+                )
+                log["warped_source_to_target"] = warped_source
+
+                # Warp reconstruction to target view
+                warped_recon = F.grid_sample(
+                    reconstructions,
+                    warp_ab,
+                    mode="bilinear",
+                    padding_mode="border",
+                    align_corners=False
+                )
+                log["warped_recon_to_target"] = warped_recon
 
         return log
