@@ -10,19 +10,19 @@ model:
     image_key: "image"
 
     # EQ-VAE specific parameters
-    p_prior: 0.5                    # Probability of applying equivariance regularization
-    scale_range: [0.25, 1.0]        # Isotropic scaling range (0.25x to 1.0x)
-    use_rotation: true              # Enable 90-degree rotations
-    equivariance_weight: 1.0        # Weight for equivariance loss term
+    p_prior: 0.5
+    scale_range: [0.25, 1.0]
+    use_rotation: true
+    equivariance_weight: 1.0
 
     ddconfig:
       double_z: true
       z_channels: 4
-      resolution: 128               # Reduced from 256
+      resolution: ${training.image_size}
       in_channels: 3
       out_ch: 3
-      ch: 64                        # Reduced from 128 (halves model size)
-      ch_mult: [1, 2, 4]            # Reduced from [1, 2, 4, 4] (removes deepest layer)
+      ch: 64                        # Reduced from 128
+      ch_mult: [1, 2, 4]            # Reduced from [1, 2, 4, 4]
       num_res_blocks: 2
       attn_resolutions: []
       dropout: 0.0
@@ -30,12 +30,12 @@ model:
     lossconfig:
       target: ldm.modules.losses.LPIPSWithDiscriminator
       params:
-        disc_start: 50001           # Start discriminator after 50k steps
-        kl_weight: 0.000001         # KL divergence weight (minimal)
-        disc_weight: 0.5            # Discriminator loss weight
-        perceptual_weight: 1.0      # LPIPS perceptual loss weight
+        disc_start: 50001
+        kl_weight: ${training.kl_weight}
+        disc_weight: 0.5
+        perceptual_weight: ${training.lpips_loss_weight}
         disc_in_channels: 3
-        disc_num_layers: 2          # Reduced from 3 (smaller discriminator)
+        disc_num_layers: 2          # Reduced from 3
         use_actnorm: false
 
 trainer:
@@ -48,12 +48,12 @@ data:
       type: omniobject
       params:
         root_dir: "/data/lab_moezkan/omni_obj/blender_renders_24_views"
-        image_size: 128             # Reduced from 256
+        image_size: ${training.image_size}
         include_plucker: false
-        sample_mode: single         # EQ-VAE uses single views with transforms
-    batch_size: 4                   # Can now use larger batch
-    val_split: 0.1
-    num_workers: 8
+        sample_mode: single
+    batch_size: ${training.batch_size}
+    val_split: ${training.val_split}
+    num_workers: ${training.num_workers}
     pin_memory: true
     persistent_workers: true
     shuffle_train: true
@@ -62,21 +62,20 @@ training:
   batch_size: 8
   image_size: 128
   num_workers: 8
-  val_size: 0.1
+  val_split: 0.1
   num_epochs: 20
   lr: 4.5e-6
   kl_weight: 0.000001
   lpips_loss_weight: 3.0
-  plucker_loss_weight: 0.0         # Not used in EQ-VAE
   ema_decay: 0.9999
   precision: 16
   output_dir: "./outputs/eqvae_small"
-  note: "Hyperarameter"
-  checkpoint_every_n_epochs: 1     # Save more frequently for testing
-  log_every_n_steps: 10            # Log more frequently for testing
+  note: "Hyperparameter"
+  checkpoint_every_n_epochs: 1
+  log_every_n_steps: 10
 
 wandb:
-  enabled: true                    # Disable for testing
+  enabled: true
   project: enhanced-VAE
   entity: deep_cv
   tags: ["eqvae", "equivariance", "omniobject", "small-model"]
