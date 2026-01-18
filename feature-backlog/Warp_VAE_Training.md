@@ -156,6 +156,7 @@ class WarpVAETrainer(BaseVAETrainer):
 | `confidence_weighted` | Weight by RoMaV2 confidence | `true` |
 | `confidence_threshold` | Min confidence for loss | 0.1 |
 | `warmup_steps` | Steps to ramp up warp weight | 1000 |
+| `vanilla_probability` | Probability of using vanilla loss only (no warp loss) | 0.0 |
 
 ## Configuration
 
@@ -182,6 +183,7 @@ trainer:
     bidirectional: true
     confidence_weighted: true
     warmup_steps: 1000
+    vanilla_probability: 0.5              # Set > 0 to randomly skip warp loss
 
 data:
   target: src.data.datamodule.VAEDataModule
