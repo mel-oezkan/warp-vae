@@ -412,6 +412,7 @@ class WarpVAETrainer(BaseVAETrainer):
         confidence_weighted: bool = True,
         confidence_threshold: float = 0.1,
         warmup_steps: int = 0,
+        vanilla_probability: float = 0.0,
     ):
         """
         Initialize Warp VAE trainer.
@@ -432,6 +433,7 @@ class WarpVAETrainer(BaseVAETrainer):
             confidence_weighted: Weight loss by RoMaV2 confidence
             confidence_threshold: Minimum confidence for loss computation
             warmup_steps: Steps before enabling warp loss (for stability)
+            vanilla_probability: Probability of using vanilla loss only (no warp loss)
         """
         super().__init__(
             model_config=model_config,
@@ -465,12 +467,16 @@ class WarpVAETrainer(BaseVAETrainer):
         else:
             self.warp_reconstruction_loss = None
 
+        # Probability of using vanilla loss only (skipping warp loss)
+        self.vanilla_probability = vanilla_probability
+
         print("[WarpVAETrainer] Initialized with:")
         print(f"  - warp_consistency_weight={warp_consistency_weight}")
         print(f"  - warp_reconstruction_weight={warp_reconstruction_weight}")
         print(f"  - consistency_loss_type={consistency_loss_type}")
         print(f"  - bidirectional={bidirectional}")
         print(f"  - warmup_steps={warmup_steps}")
+        print(f"  - vanilla_probability={vanilla_probability}")
 
     def _get_model_output(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Any]:
         """
@@ -579,6 +585,9 @@ class WarpVAETrainer(BaseVAETrainer):
 
         Processes paired images and enforces latent space consistency
         across views using RoMaV2 correspondences.
+
+        With probability `vanilla_probability`, the warp loss is skipped
+        and only the vanilla VAE loss is used.
         """
         opt_ae, opt_disc = self.optimizers()
 
@@ -587,8 +596,8 @@ class WarpVAETrainer(BaseVAETrainer):
         reconstructions, posterior = self.model(inputs, sample_posterior=True)
         latent_a = posterior.sample()
 
-        # Get target encoding
-        latent_b = self._get_target_encoding(batch)
+        # Decide whether to use vanilla loss only (skip warp loss)
+        use_vanilla_only = torch.rand(1).item() < self.vanilla_probability
 
         # ========== Optimize Autoencoder ==========
         # Standard reconstruction loss
@@ -602,10 +611,20 @@ class WarpVAETrainer(BaseVAETrainer):
             split="train",
         )
 
-        # Warp consistency loss
-        warp_loss, warp_log_dict = self._compute_warp_losses(
-            batch, latent_a, latent_b, reconstructions, split="train"
-        )
+        # Compute warp loss only if not using vanilla mode
+        if use_vanilla_only:
+            warp_loss = torch.tensor(0.0, device=inputs.device)
+            warp_log_dict = {
+                "train/warp_consistency_loss": torch.tensor(0.0, device=inputs.device),
+                "train/warp_factor": torch.tensor(0.0, device=inputs.device),
+            }
+        else:
+            # Get target encoding
+            latent_b = self._get_target_encoding(batch)
+            # Warp consistency loss
+            warp_loss, warp_log_dict = self._compute_warp_losses(
+                batch, latent_a, latent_b, reconstructions, split="train"
+            )
 
         total_ae_loss = aeloss + warp_loss
 
@@ -618,6 +637,7 @@ class WarpVAETrainer(BaseVAETrainer):
         self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
         self.log("train/warp_loss", warp_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
         self.log("train/total_ae_loss", total_ae_loss, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        self.log("train/vanilla_mode", float(use_vanilla_only), prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
         # Filter out total_loss from log_dict_ae to avoid duplicate logging
         log_dict_ae_filtered = {k: v for k, v in log_dict_ae.items() if "total_loss" not in k}
         self.log_dict(log_dict_ae_filtered, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
