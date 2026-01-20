@@ -116,7 +116,6 @@ class MultiViewVisualizer:
 
         if save_path:
             save_path = Path(save_path)
-            plt.savefig(f"{save_path}.pdf", bbox_inches='tight', dpi=150)
             plt.savefig(f"{save_path}.png", bbox_inches='tight', dpi=150)
             print(f"  ✓ Saved to {save_path}.pdf/.png")
 
