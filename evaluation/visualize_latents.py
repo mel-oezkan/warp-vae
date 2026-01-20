@@ -3,8 +3,11 @@
 Latent Space Visualization Script for VAE Models.
 
 Visualizes:
-1. Per-channel latent distributions and statistics
-2. PCA analysis of the latent space
+1. PCA analysis of the latent space 
+    - show original image
+    - show original latent channels mean
+    - show PCA-reduced latent channels
+
 
 Usage:
     python evaluation/visualize_latents.py \
@@ -309,50 +312,61 @@ def extract_latents(model, dataloader, num_samples, device):
     }
 
 
-def visualize_latents(latents, latents_spatial, images, save_dir):
-    """Create comprehensive latent visualization.
+def visualize_latents(latents_spatial, images, save_dir):
+    """Create latent visualization showing input images and all latent channels.
 
     Args:
-        latents: (N, C) numpy array of flattened latents
         latents_spatial: (N, C, H, W) numpy array of spatial latents (optional)
         images: (N, 3, H, W) numpy array of images (optional)
         save_dir: Directory to save outputs
     """
     save_dir = Path(save_dir)
-    n_samples, n_channels = latents.shape
 
-    fig = plt.figure(figsize=(16, 8))
+    if latents_spatial is None or images is None:
+        print("  Warning: No spatial latents or images available for visualization")
+        return
 
-    # 1. Per-channel distribution histograms (top row)
-    for i in range(min(n_channels, 4)):
-        ax = fig.add_subplot(2, 4, i + 1)
-        ax.hist(latents[:, i], bins=50, density=True, alpha=0.7, color=f'C{i}', edgecolor='black')
-        ax.axvline(latents[:, i].mean(), color='red', linestyle='--', linewidth=2, label=f'Mean: {latents[:, i].mean():.3f}')
-        ax.axvline(0, color='gray', linestyle=':', linewidth=1)
-        ax.set_xlabel(f'Channel {i}')
-        ax.set_ylabel('Density')
-        ax.set_title(f'Channel {i} Distribution')
-        ax.legend(fontsize=8)
+    n_samples = min(8, latents_spatial.shape[0])
+    n_channels = latents_spatial.shape[1]
 
-    # 2. Spatial structure visualization (bottom row) - show latent channels as images
-    if latents_spatial is not None and images is not None:
-        n_show = min(4, latents_spatial.shape[0])
-        for i in range(n_show):
-            # Show input image
-            ax_img = fig.add_subplot(2, 4, 5 + i)
-            img = images[i]
-            img = (img * 0.5 + 0.5)  # Denormalize from [-1, 1] to [0, 1]
-            img = np.clip(img, 0, 1)
-            img = np.transpose(img, (1, 2, 0))
-            ax_img.imshow(img)
-            ax_img.axis('off')
-            ax_img.set_title(f'Input {i}', fontsize=10)
+    # Create figure: 1 + n_channels rows (input images + each latent channel)
+    n_rows = 1 + n_channels
+    fig, axes = plt.subplots(n_rows, n_samples, figsize=(n_samples * 2.5, n_rows * 2.5))
 
-    plt.suptitle(f'Latent Space Analysis (N={n_samples}, C={n_channels})', fontsize=14, fontweight='bold')
+    for i in range(n_samples):
+        # Row 0: Input image
+        img = images[i]
+        img = (img * 0.5 + 0.5)  # Denormalize from [-1, 1] to [0, 1]
+        img = np.clip(img, 0, 1)
+        img = np.transpose(img, (1, 2, 0))
+        axes[0, i].imshow(img)
+        axes[0, i].axis('off')
+        axes[0, i].set_title(f'Sample {i}', fontsize=10)
+
+        # Rows 1 to n_channels: Individual latent channels
+        for c in range(n_channels):
+            lat_channel = latents_spatial[i, c]  # (H, W)
+            # Normalize each channel independently for visualization
+            vmin, vmax = np.percentile(lat_channel, [2, 98])
+            lat_norm = np.clip((lat_channel - vmin) / (vmax - vmin + 1e-8), 0, 1)
+            axes[c + 1, i].imshow(lat_norm, cmap='viridis')
+            axes[c + 1, i].axis('off')
+
+    # Add y-labels for the first column
+    axes[0, 0].set_ylabel('Input', fontsize=12)
+    for c in range(n_channels):
+        axes[c + 1, 0].set_ylabel(f'Latent Ch {c}', fontsize=12)
+
+    # Re-enable the y-axis label display (axis was turned off)
+    for row in range(n_rows):
+        axes[row, 0].yaxis.set_visible(True)
+        axes[row, 0].yaxis.label.set_visible(True)
+
+    plt.suptitle(f'Input Images and Latent Channels (C={n_channels})', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(save_dir / 'latent_distributions.png', dpi=150, bbox_inches='tight')
+    plt.savefig(save_dir / 'latent_samples.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"  Saved latent_distributions.png")
+    print(f"  Saved latent_samples.png")
 
 
 def visualize_latent_pca(latents_spatial, images, save_dir):
@@ -537,9 +551,8 @@ def main():
     print(f"  Extracted latents shape: {latent_data['latents'].shape}")
 
     # Generate visualizations
-    print("\nGenerating latent distribution visualization...")
+    print("\nGenerating latent visualization...")
     visualize_latents(
-        latents=latent_data['latents'],
         latents_spatial=latent_data['latents_spatial'],
         images=latent_data['images'],
         save_dir=output_dir
@@ -557,7 +570,7 @@ def main():
     print("\n" + "=" * 60)
     print("Visualization complete!")
     print(f"Results saved to: {output_dir}/")
-    print("  - latent_distributions.png")
+    print("  - latent_samples.png")
     if not args.skip_pca:
         print("  - latent_pca.png")
     print("=" * 60)
