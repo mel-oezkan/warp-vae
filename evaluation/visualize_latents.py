@@ -12,6 +12,7 @@ Visualizes:
 Usage:
     python evaluation/visualize_latents.py \
         --checkpoint outputs/warp_vae/checkpoints/last.ckpt \
+        --config configs/vae_config.yaml \
         --output_name my_experiment \
         --dataset_type co3d \
         --data_dir /data/lab_moezkan/co3d_full/toybus \
@@ -45,6 +46,13 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 torch._dynamo.disable()
 
+# Optional safetensors import
+try:
+    from safetensors.torch import load_file as load_safetensors
+    SAFETENSORS_AVAILABLE = True
+except ImportError:
+    SAFETENSORS_AVAILABLE = False
+
 
 def denormalize(tensor):
     """Convert from [-1, 1] to [0, 1] range."""
@@ -70,12 +78,24 @@ def detect_architecture(state_dict):
 
     has_down_3 = any("encoder.down.3" in k for k in state_dict.keys())
 
-    # Also check actual channel size from first conv layer
-    ch = 64  # default
+    # Check actual channel size from conv_in layer (most reliable)
+    ch = None
     for k, v in state_dict.items():
-        if 'encoder.down.0.block.0.conv1.weight' in k:
-            ch = v.shape[0]  # Output channels
+        if k == 'encoder.conv_in.weight' or k.endswith('encoder.conv_in.weight'):
+            ch = v.shape[0]  # Output channels of first conv
             break
+    
+    # Fallback: check from down blocks
+    if ch is None:
+        for k, v in state_dict.items():
+            if 'encoder.down.0.block.0.conv1.weight' in k:
+                ch = v.shape[0]  # Output channels
+                break
+    
+    # Default to SD architecture if we can't detect
+    if ch is None:
+        ch = 128
+        print("  Warning: Could not detect ch from state_dict, defaulting to 128")
 
     if has_down_3:
         # Full SD architecture (4 down blocks)
@@ -85,104 +105,126 @@ def detect_architecture(state_dict):
         return ch, [1, 2, 4]
 
 
-def load_model(checkpoint_path, config_path=None, use_vanilla_sd=False):
+def load_model(checkpoint_path, config_path):
     """Load VAE model from checkpoint.
 
     Args:
-        checkpoint_path: Path to model checkpoint
-        config_path: Optional path to config YAML for model instantiation
-        use_vanilla_sd: Force vanilla SD architecture (ch=128, ch_mult=[1,2,4,4])
+        checkpoint_path: Path to model checkpoint (.ckpt, .pt, or .safetensors)
+        config_path: Path to config file (JSON for diffusers-style or YAML for LDM-style)
 
     Returns:
         model: Loaded VAE model
     """
     from ldm.models.autoencoder import AutoencoderKL
 
-    # If config provided, use it
-    if config_path:
-        import yaml
-        from ldm.util import instantiate_from_config
-
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
-
-        model = instantiate_from_config(config['model'])
-        print(f"Model instantiated from config: {config['model']['target']}")
+    # Convert to string for extension checking
+    checkpoint_path_str = str(checkpoint_path)
+    config_path_str = str(config_path)
+    
+    print(f"Loading checkpoint from {checkpoint_path_str}")
+    print(f"Loading config from {config_path_str}")
+    
+    # Load state dict from checkpoint
+    if checkpoint_path_str.endswith('.safetensors'):
+        if not SAFETENSORS_AVAILABLE:
+            raise ImportError(
+                "safetensors package is required to load .safetensors files. "
+                "Install it with: pip install safetensors"
+            )
+        print("  Loading safetensors format...")
+        state_dict = load_safetensors(checkpoint_path_str)
     else:
-        # Auto-detect or use specified architecture
-        print(f"Loading checkpoint from {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-
-        # Extract state dict
-        if "state_dict" in ckpt:
+        print("  Loading PyTorch checkpoint format...")
+        ckpt = torch.load(checkpoint_path_str, map_location="cpu", weights_only=False)
+        if isinstance(ckpt, dict) and "state_dict" in ckpt:
             state_dict = ckpt["state_dict"]
-            # Handle first_stage_model prefix (SD format)
-            if any("first_stage_model" in k for k in state_dict.keys()):
-                print("  Detected SD checkpoint format (first_stage_model prefix)")
-                state_dict = {
-                    k.replace("first_stage_model.", ""): v
-                    for k, v in state_dict.items()
-                    if "first_stage_model" in k
-                }
-            # Handle model. prefix (training format)
-            elif any(k.startswith("model.") for k in state_dict.keys()):
-                print("  Detected training checkpoint format (model. prefix)")
-                state_dict = {
-                    k.replace("model.", ""): v
-                    for k, v in state_dict.items()
-                    if k.startswith("model.")
-                }
         else:
             state_dict = ckpt
 
-        # Detect architecture from state dict
-        if use_vanilla_sd:
-            ch, ch_mult = 128, [1, 2, 4, 4]
-            print("  Using vanilla SD architecture (ch=128, ch_mult=[1,2,4,4])")
-        else:
-            ch, ch_mult = detect_architecture(state_dict)
-            print(f"  Detected architecture: ch={ch}, ch_mult={ch_mult}")
+    # Handle key prefixes
+    if any("first_stage_model" in k for k in state_dict.keys()):
+        print("  Detected SD checkpoint format (first_stage_model prefix)")
+        state_dict = {
+            k.replace("first_stage_model.", ""): v
+            for k, v in state_dict.items()
+            if "first_stage_model" in k
+        }
+    elif any(k.startswith("model.") for k in state_dict.keys()):
+        print("  Detected training checkpoint format (model. prefix)")
+        state_dict = {
+            k.replace("model.", ""): v
+            for k, v in state_dict.items()
+            if k.startswith("model.")
+        }
 
-        # Create model config
+    # Load config and create model
+    if config_path_str.endswith('.json'):
+        # Diffusers-style config.json
+        with open(config_path_str, 'r') as f:
+            config = json.load(f)
+        
+        # Convert diffusers config to ldm ddconfig
+        block_out_channels = config.get('block_out_channels', [128, 256, 512, 512])
+        ch = block_out_channels[0]
+        ch_mult = [c // ch for c in block_out_channels]
+        
         ddconfig = {
             "double_z": True,
-            "z_channels": 4,
-            "resolution": 256 if use_vanilla_sd else 128,
-            "in_channels": 3,
-            "out_ch": 3,
+            "z_channels": config.get('latent_channels', 4),
+            "resolution": config.get('sample_size', 256),
+            "in_channels": config.get('in_channels', 3),
+            "out_ch": config.get('out_channels', 3),
             "ch": ch,
             "ch_mult": ch_mult,
-            "num_res_blocks": 2,
+            "num_res_blocks": config.get('layers_per_block', 2),
             "attn_resolutions": [],
             "dropout": 0.0,
         }
-
-        lossconfig = {
-            "target": "ldm.modules.losses.LPIPSWithDiscriminator",
-            "params": {
-                "disc_start": 50001,
-                "kl_weight": 0.000001,
-                "disc_weight": 0.5,
-                "perceptual_weight": 1.0,
-                "disc_in_channels": 3,
-                "disc_num_layers": 3 if use_vanilla_sd else 2,
-                "use_actnorm": False,
-            },
-        }
-
+        
+        print(f"  Parsed diffusers config: ch={ch}, ch_mult={ch_mult}")
+        print(f"    latent_channels: {ddconfig['z_channels']}")
+        
         model = AutoencoderKL(
             ddconfig=ddconfig,
-            lossconfig=lossconfig,
-            embed_dim=4,
+            lossconfig={"target": "torch.nn.Identity"},
+            embed_dim=ddconfig['z_channels'],
         )
+        
+    elif config_path_str.endswith('.yaml') or config_path_str.endswith('.yml'):
+        # LDM-style YAML config with OmegaConf for variable interpolation
+        from omegaconf import OmegaConf
+        from ldm.util import instantiate_from_config
 
-        # Load weights
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            print(f"  Warning: {len(missing)} missing keys")
-        if unexpected:
-            print(f"  Warning: {len(unexpected)} unexpected keys")
-        print("  Checkpoint loaded successfully")
+        # Load with OmegaConf to resolve ${} interpolations
+        yaml_config = OmegaConf.load(config_path_str)
+        
+        # Resolve all interpolations
+        OmegaConf.resolve(yaml_config)
+        
+        # Convert to plain dict for instantiate_from_config
+        yaml_config = OmegaConf.to_container(yaml_config, resolve=True)
+
+        if 'model' in yaml_config:
+            model = instantiate_from_config(yaml_config['model'])
+            print(f"  Model instantiated from YAML config")
+        else:
+            raise ValueError("YAML config must contain 'model' key")
+    else:
+        raise ValueError(f"Unknown config file format: {config_path_str}. Use .json or .yaml/.yml")
+
+    # Load weights
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"  Warning: {len(missing)} missing keys")
+        if len(missing) <= 10:
+            for k in missing:
+                print(f"    - {k}")
+    if unexpected:
+        print(f"  Warning: {len(unexpected)} unexpected keys")
+        if len(unexpected) <= 10:
+            for k in unexpected:
+                print(f"    - {k}")
+    print("  Checkpoint loaded successfully")
 
     return model
 
@@ -341,80 +383,68 @@ def visualize_latents_by_subcategory(data_by_subcat, save_dir, n_samples_per_sub
         n_samples_per_subcat: Number of samples to show per subcategory
     """
     save_dir = Path(save_dir)
+    latents_dir = save_dir / 'latent_samples'
+    latents_dir.mkdir(parents=True, exist_ok=True)
 
     if not data_by_subcat:
         print("  Warning: No data available for visualization")
         return
 
-    subcategories = list(data_by_subcat.keys())
-    n_subcats = len(subcategories)
-    
-    # Get number of latent channels from first subcategory
-    first_subcat = subcategories[0]
-    n_channels = data_by_subcat[first_subcat]['latents_spatial'].shape[1]
-    
-    # Create figure: (1 + n_channels) rows per subcategory, n_samples_per_subcat columns
-    n_rows_per_subcat = 1 + n_channels  # input + each latent channel
-    total_rows = n_subcats * n_rows_per_subcat
-    
-    fig, axes = plt.subplots(total_rows, n_samples_per_subcat, 
-                              figsize=(n_samples_per_subcat * 2.5, total_rows * 2))
-    
-    # Handle case where axes might be 1D
-    if total_rows == 1:
-        axes = axes.reshape(1, -1)
-    if n_samples_per_subcat == 1:
-        axes = axes.reshape(-1, 1)
-
-    for subcat_idx, subcat_name in enumerate(subcategories):
-        subcat_data = data_by_subcat[subcat_name]
+    for subcat_name, subcat_data in data_by_subcat.items():
         images = subcat_data['images']
         latents_spatial = subcat_data['latents_spatial']
         
+        n_channels = latents_spatial.shape[1]
         n_available = min(n_samples_per_subcat, images.shape[0])
-        base_row = subcat_idx * n_rows_per_subcat
         
-        for i in range(n_samples_per_subcat):
-            if i < n_available:
-                # Row 0: Input image
-                img = images[i]
-                img = (img * 0.5 + 0.5)  # Denormalize from [-1, 1] to [0, 1]
-                img = np.clip(img, 0, 1)
-                img = np.transpose(img, (1, 2, 0))
-                axes[base_row, i].imshow(img)
-                
-                # Rows 1 to n_channels: Individual latent channels
-                for c in range(n_channels):
-                    lat_channel = latents_spatial[i, c]  # (H, W)
-                    vmin, vmax = np.percentile(lat_channel, [2, 98])
-                    lat_norm = np.clip((lat_channel - vmin) / (vmax - vmin + 1e-8), 0, 1)
-                    axes[base_row + c + 1, i].imshow(lat_norm, cmap='viridis')
+        # Create figure: (1 + n_channels) rows, n_samples columns
+        n_rows = 1 + n_channels  # input + each latent channel
+        
+        fig, axes = plt.subplots(n_rows, n_available, 
+                                  figsize=(n_available * 2.5, n_rows * 2))
+        
+        # Handle case where axes might be 1D
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+        if n_available == 1:
+            axes = axes.reshape(-1, 1)
+
+        for i in range(n_available):
+            # Row 0: Input image
+            img = images[i]
+            img = (img * 0.5 + 0.5)  # Denormalize from [-1, 1] to [0, 1]
+            img = np.clip(img, 0, 1)
+            img = np.transpose(img, (1, 2, 0))
+            axes[0, i].imshow(img)
+            axes[0, i].set_title(f'Sample {i}', fontsize=10)
+            
+            # Rows 1 to n_channels: Individual latent channels
+            for c in range(n_channels):
+                lat_channel = latents_spatial[i, c]  # (H, W)
+                vmin, vmax = np.percentile(lat_channel, [2, 98])
+                lat_norm = np.clip((lat_channel - vmin) / (vmax - vmin + 1e-8), 0, 1)
+                axes[c + 1, i].imshow(lat_norm, cmap='viridis')
             
             # Turn off axes for all
-            for row_offset in range(n_rows_per_subcat):
-                axes[base_row + row_offset, i].axis('off')
+            for row in range(n_rows):
+                axes[row, i].axis('off')
         
         # Add y-labels for the first column
-        axes[base_row, 0].set_ylabel(f'{subcat_name}\nInput', fontsize=10)
+        axes[0, 0].set_ylabel('Input', fontsize=10)
         for c in range(n_channels):
-            axes[base_row + c + 1, 0].set_ylabel(f'Ch {c}', fontsize=10)
+            axes[c + 1, 0].set_ylabel(f'Ch {c}', fontsize=10)
         
         # Re-enable y-axis label display
-        for row_offset in range(n_rows_per_subcat):
-            axes[base_row + row_offset, 0].yaxis.set_visible(True)
-            axes[base_row + row_offset, 0].yaxis.label.set_visible(True)
-        
-        # Add title for first sample of each subcategory
-        if subcat_idx == 0:
-            for i in range(n_samples_per_subcat):
-                axes[base_row, i].set_title(f'Sample {i}', fontsize=10)
+        for row in range(n_rows):
+            axes[row, 0].yaxis.set_visible(True)
+            axes[row, 0].yaxis.label.set_visible(True)
 
-    plt.suptitle(f'Latent Samples by Subcategory ({n_subcats} subcategories, C={n_channels})', 
-                 fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(save_dir / 'latent_samples.png', dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved latent_samples.png")
+        plt.suptitle(f'Latent Samples: {subcat_name} (C={n_channels})', 
+                     fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(latents_dir / f'{subcat_name}.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved latent_samples/{subcat_name}.png")
 
 
 def visualize_latent_pca_by_subcategory(data_by_subcat, save_dir, n_samples_per_subcat=5):
@@ -426,103 +456,92 @@ def visualize_latent_pca_by_subcategory(data_by_subcat, save_dir, n_samples_per_
         n_samples_per_subcat: Number of samples to show per subcategory
     """
     save_dir = Path(save_dir)
+    pca_dir = save_dir / 'latent_pca'
+    pca_dir.mkdir(parents=True, exist_ok=True)
 
     if not data_by_subcat:
         print("  Warning: No data available for PCA visualization")
         return
 
-    subcategories = list(data_by_subcat.keys())
-    n_subcats = len(subcategories)
-    
-    # Get dimensions from first subcategory
-    first_subcat = subcategories[0]
-    n_channels = data_by_subcat[first_subcat]['latents_spatial'].shape[1]
-    
-    # Create figure: 3 rows per subcategory (input, raw latent, PCA)
-    n_rows_per_subcat = 3
-    total_rows = n_subcats * n_rows_per_subcat
-    
-    fig, axes = plt.subplots(total_rows, n_samples_per_subcat, 
-                              figsize=(n_samples_per_subcat * 2.5, total_rows * 2.5))
-    
-    if total_rows == 1:
-        axes = axes.reshape(1, -1)
-    if n_samples_per_subcat == 1:
-        axes = axes.reshape(-1, 1)
-
-    all_explained_variance = []
-
-    for subcat_idx, subcat_name in enumerate(subcategories):
-        subcat_data = data_by_subcat[subcat_name]
+    for subcat_name, subcat_data in data_by_subcat.items():
         images = subcat_data['images']
         latents_spatial = subcat_data['latents_spatial']
         
+        n_channels = latents_spatial.shape[1]
         n_available = min(n_samples_per_subcat, images.shape[0])
         _, _, h, w = latents_spatial.shape
-        base_row = subcat_idx * n_rows_per_subcat
         
-        for i in range(n_samples_per_subcat):
-            if i < n_available:
-                # Row 0: Input image
-                img = images[i]
-                img = (img * 0.5 + 0.5)
-                img = np.clip(img, 0, 1)
-                img = np.transpose(img, (1, 2, 0))
-                axes[base_row, i].imshow(img)
+        # Create figure: 3 rows (input, raw latent, PCA), n_samples columns
+        n_rows = 3
+        
+        fig, axes = plt.subplots(n_rows, n_available, 
+                                  figsize=(n_available * 2.5, n_rows * 2.5))
+        
+        if n_rows == 1:
+            axes = axes.reshape(1, -1)
+        if n_available == 1:
+            axes = axes.reshape(-1, 1)
 
-                # Row 1: Raw latent (first 3 channels as RGB)
-                lat_raw = latents_spatial[i][:3]
-                lat_raw = np.transpose(lat_raw, (1, 2, 0))
-                lat_raw = (lat_raw - lat_raw.min()) / (lat_raw.max() - lat_raw.min() + 1e-8)
-                axes[base_row + 1, i].imshow(lat_raw)
+        explained_variances = []
 
-                # Row 2: PCA latent
-                lat_single = latents_spatial[i]
-                lat_flat = lat_single.transpose(1, 2, 0).reshape(-1, n_channels)
+        for i in range(n_available):
+            # Row 0: Input image
+            img = images[i]
+            img = (img * 0.5 + 0.5)
+            img = np.clip(img, 0, 1)
+            img = np.transpose(img, (1, 2, 0))
+            axes[0, i].imshow(img)
+            axes[0, i].set_title(f'Sample {i}', fontsize=10)
 
-                pca = PCA(n_components=3)
-                lat_pca_flat = pca.fit_transform(lat_flat)
-                all_explained_variance.append(pca.explained_variance_ratio_)
+            # Row 1: Raw latent (first 3 channels as RGB)
+            lat_raw = latents_spatial[i][:3]
+            lat_raw = np.transpose(lat_raw, (1, 2, 0))
+            lat_raw = (lat_raw - lat_raw.min()) / (lat_raw.max() - lat_raw.min() + 1e-8)
+            axes[1, i].imshow(lat_raw)
 
-                lat_pca = lat_pca_flat.reshape(h, w, 3)
-                lat_pca_norm = np.zeros_like(lat_pca)
-                for c in range(3):
-                    channel = lat_pca[..., c]
-                    vmin, vmax = np.percentile(channel, [2, 98])
-                    lat_pca_norm[..., c] = np.clip((channel - vmin) / (vmax - vmin + 1e-8), 0, 1)
+            # Row 2: PCA latent
+            lat_single = latents_spatial[i]
+            lat_flat = lat_single.transpose(1, 2, 0).reshape(-1, n_channels)
 
-                axes[base_row + 2, i].imshow(lat_pca_norm)
+            pca = PCA(n_components=3)
+            lat_pca_flat = pca.fit_transform(lat_flat)
+            explained_variances.append(pca.explained_variance_ratio_)
+
+            lat_pca = lat_pca_flat.reshape(h, w, 3)
+            lat_pca_norm = np.zeros_like(lat_pca)
+            for c in range(3):
+                channel = lat_pca[..., c]
+                vmin, vmax = np.percentile(channel, [2, 98])
+                lat_pca_norm[..., c] = np.clip((channel - vmin) / (vmax - vmin + 1e-8), 0, 1)
+
+            axes[2, i].imshow(lat_pca_norm)
             
             # Turn off axes
-            for row_offset in range(n_rows_per_subcat):
-                axes[base_row + row_offset, i].axis('off')
+            for row in range(n_rows):
+                axes[row, i].axis('off')
         
         # Add y-labels
-        axes[base_row, 0].set_ylabel(f'{subcat_name}\nInput', fontsize=10)
-        axes[base_row + 1, 0].set_ylabel('Latent', fontsize=10)
-        axes[base_row + 2, 0].set_ylabel('PCA', fontsize=10)
+        axes[0, 0].set_ylabel('Input', fontsize=10)
+        axes[1, 0].set_ylabel('Latent', fontsize=10)
+        axes[2, 0].set_ylabel('PCA', fontsize=10)
         
-        for row_offset in range(n_rows_per_subcat):
-            axes[base_row + row_offset, 0].yaxis.set_visible(True)
-            axes[base_row + row_offset, 0].yaxis.label.set_visible(True)
-        
-        if subcat_idx == 0:
-            for i in range(n_samples_per_subcat):
-                axes[base_row, i].set_title(f'Sample {i}', fontsize=10)
+        for row in range(n_rows):
+            axes[row, 0].yaxis.set_visible(True)
+            axes[row, 0].yaxis.label.set_visible(True)
 
-    # Compute average explained variance
-    if all_explained_variance:
-        avg_var = np.mean(all_explained_variance, axis=0)
-        var_text = f"Avg PCA explained variance: PC1={avg_var[0]:.1%}, PC2={avg_var[1]:.1%}, PC3={avg_var[2]:.1%}"
-    else:
-        var_text = ""
-    
-    fig.suptitle(f'Latent Space PCA by Subcategory ({n_subcats} subcategories)\n{var_text}', 
-                 fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(save_dir / 'latent_pca.png', dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved latent_pca.png")
+        # Compute average explained variance for this subcategory
+        if explained_variances:
+            avg_var = np.mean(explained_variances, axis=0)
+            var_text = f"Avg PCA: PC1={avg_var[0]:.1%}, PC2={avg_var[1]:.1%}, PC3={avg_var[2]:.1%}"
+        else:
+            var_text = ""
+        
+        fig.suptitle(f'Latent PCA: {subcat_name}\n{var_text}', 
+                     fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(pca_dir / f'{subcat_name}.png', dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved latent_pca/{subcat_name}.png")
 
 
 def parse_args():
@@ -534,6 +553,8 @@ def parse_args():
     # Required arguments
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="Path to model checkpoint")
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to config file (JSON or YAML)")
     parser.add_argument("--output_name", type=str, required=True,
                         help="Subfolder name under eval_outputs/")
 
@@ -547,12 +568,6 @@ def parse_args():
                         help="Bounding box file for CO3D datasets")
     parser.add_argument("--no_crop", action="store_true",
                         help="Disable cropping images based on bounding boxes")
-
-    # Model options
-    parser.add_argument("--config", type=str, default=None,
-                        help="Optional config YAML for model instantiation")
-    parser.add_argument("--vanilla_sd", action="store_true",
-                        help="Force vanilla SD architecture (ch=128, ch_mult=[1,2,4,4])")
 
     # Visualization options
     parser.add_argument("--num_subcategories", type=int, default=5,
@@ -588,7 +603,6 @@ def main():
     model = load_model(
         checkpoint_path=args.checkpoint,
         config_path=args.config,
-        use_vanilla_sd=args.vanilla_sd
     )
     model = model.to(device)
     model.eval()
@@ -668,9 +682,9 @@ def main():
     print("\n" + "=" * 60)
     print("Visualization complete!")
     print(f"Results saved to: {output_dir}/")
-    print("  - latent_samples.png")
+    print(f"  - latent_samples/ ({len(selected_subcats)} files)")
     if not args.skip_pca:
-        print("  - latent_pca.png")
+        print(f"  - latent_pca/ ({len(selected_subcats)} files)")
     print(f"Visualized {len(selected_subcats)} subcategories: {selected_subcats}")
     print("=" * 60)
 
