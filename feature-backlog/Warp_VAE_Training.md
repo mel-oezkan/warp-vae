@@ -204,45 +204,45 @@ data:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Training Step                            │
+│                         Training Step                           │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. DataLoader loads batch:                                      │
+│                                                                 │
+│  1. DataLoader loads batch:                                     │
 │     ┌──────────────────────────────────────────────┐            │
 │     │ WarpCO3DDataset.__getitem__():               │            │
 │     │   - Load image pair from CO3D                │            │
-│     │   - Compute RoMaV2 warp on-the-fly          │            │
+│     │   - Compute RoMaV2 warp on-the-fly           │            │
 │     │   - Return {image, image_target, warps...}   │            │
 │     └──────────────────────────────────────────────┘            │
-│                           │                                      │
-│                           ▼                                      │
-│  2. Forward pass:                                                │
+│                           │                                     │
+│                           ▼                                     │
+│  2. Forward pass:                                               │
 │     ┌──────────────────────────────────────────────┐            │
 │     │ img_a ──► Encoder ──► posterior_a ──► latent_a            │
 │     │ img_b ──► Encoder ──► posterior_b ──► latent_b            │
 │     │ latent_a ──► Decoder ──► recon_a                          │
 │     └──────────────────────────────────────────────┘            │
-│                           │                                      │
-│                           ▼                                      │
-│  3. Loss computation:                                            │
+│                           │                                     │
+│                           ▼                                     │
+│  3. Loss computation:                                           │
 │     ┌──────────────────────────────────────────────┐            │
-│     │ AE Loss:                                      │            │
+│     │ AE Loss:                                     │            │
 │     │   - L1/L2 reconstruction: |recon_a - img_a|  │            │
 │     │   - KL divergence: KL(posterior || N(0,1))   │            │
 │     │   - Perceptual (LPIPS): lpips(recon_a, img_a)│            │
 │     │   - Discriminator: D(recon_a) (after warmup) │            │
-│     │                                               │            │
-│     │ Warp Loss:                                    │            │
+│     │                                              │            │
+│     │ Warp Loss:                                   │            │
 │     │   - Resize warp to latent resolution         │            │
 │     │   - warped_a = grid_sample(latent_a, warp)   │            │
 │     │   - loss = |warped_a - latent_b| * confidence│            │
 │     └──────────────────────────────────────────────┘            │
-│                           │                                      │
-│                           ▼                                      │
-│  4. Backward + Optimize:                                         │
+│                           │                                     │
+│                           ▼                                     │
+│  4. Backward + Optimize:                                        │
 │     total_loss = ae_loss + warp_weight * warp_loss              │
-│     optimizer.step()                                             │
-│                                                                  │
+│     optimizer.step()                                            │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
