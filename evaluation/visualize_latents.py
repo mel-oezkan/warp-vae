@@ -21,6 +21,9 @@ Usage:
 import os
 import sys
 import argparse
+import gzip
+import json
+from typing import IO, cast
 
 # Add project root to path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -184,6 +187,26 @@ def load_model(checkpoint_path, config_path=None, use_vanilla_sd=False):
     return model
 
 
+def get_subcategories_from_bb_file(bb_file: str, min_samples: int = 5) -> list:
+    """Extract subcategory names from bounding box file.
+    
+    Args:
+        bb_file: Path to gzipped JSON bounding box file
+        min_samples: Minimum number of samples required per subcategory
+        
+    Returns:
+        List of subcategory names with at least min_samples samples
+    """
+    with gzip.GzipFile(bb_file, "rb") as f:
+        obj_dict = json.loads(cast(IO, f).read().decode("utf8"))
+    
+    # Filter subcategories with enough samples
+    subcategories = [name for name, samples in obj_dict.items() 
+                     if len(samples) >= min_samples]
+    
+    return sorted(subcategories)
+
+
 def load_dataset(dataset_type, data_dir, image_size=256, bb_file=None, crop_images=True, **kwargs):
     """Load dataset based on type.
 
@@ -239,211 +262,263 @@ def load_dataset(dataset_type, data_dir, image_size=256, bb_file=None, crop_imag
     return dataset
 
 
-def extract_latents(model, dataloader, num_samples, device):
-    """Extract latent codes from dataset samples.
+def extract_latents_by_subcategory(model, datasets_by_subcat, num_samples_per_subcat, device):
+    """Extract latent codes from multiple subcategories.
 
     Args:
         model: VAE model
-        dataloader: DataLoader with images
-        num_samples: Number of samples to extract
+        datasets_by_subcat: Dict mapping subcategory name to dataset
+        num_samples_per_subcat: Number of samples to extract per subcategory
         device: Torch device
 
     Returns:
-        dict with:
-            - latents: (N, C) flattened latents
-            - latents_spatial: (N, C, H, W) spatial latents (first 100)
-            - images: (N, 3, H, W) input images (first 100)
+        dict mapping subcategory name to dict with:
+            - latents_spatial: (N, C, H, W) spatial latents
+            - images: (N, 3, H, W) input images
     """
-    latents = []
-    latents_spatial = []
-    images = []
-    samples_processed = 0
-
+    from torch.utils.data import DataLoader
+    
+    results = {}
     model.eval()
     
-    # Calculate expected number of batches needed
-    batch_size = dataloader.batch_size
-    batches_needed = (num_samples + batch_size - 1) // batch_size
-    total_batches = len(dataloader)
-    
-    print(f"  Target: {num_samples} samples ({batches_needed} batches needed, {total_batches} total available)")
-    
-    with torch.no_grad():
-        pbar = tqdm(dataloader, desc=f"Extracting latents [0/{num_samples}]", total=min(batches_needed, total_batches))
-        for batch in pbar:
-            if samples_processed >= num_samples:
-                break
+    for subcat_name, dataset in datasets_by_subcat.items():
+        print(f"  Processing subcategory: {subcat_name} ({len(dataset)} samples available)")
+        
+        dataloader = DataLoader(
+            dataset,
+            batch_size=min(8, num_samples_per_subcat),
+            shuffle=True,  # Shuffle to get variety
+            num_workers=2,
+            pin_memory=True
+        )
+        
+        latents_spatial = []
+        images = []
+        samples_processed = 0
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                if samples_processed >= num_samples_per_subcat:
+                    break
 
-            # Get images from batch
-            if isinstance(batch, dict):
-                imgs = batch.get('image', batch.get('images'))
-            else:
-                imgs = batch[0]
+                # Get images from batch
+                if isinstance(batch, dict):
+                    imgs = batch.get('image', batch.get('images'))
+                else:
+                    imgs = batch[0]
 
-            imgs = imgs.to(device)
+                imgs = imgs.to(device)
 
-            # Encode
-            if hasattr(model, 'ema_scope') and hasattr(model, 'model_ema') and model.model_ema is not None:
-                with model.ema_scope():
+                # Encode
+                if hasattr(model, 'ema_scope') and hasattr(model, 'model_ema') and model.model_ema is not None:
+                    with model.ema_scope():
+                        posterior = model.encode(imgs)
+                else:
                     posterior = model.encode(imgs)
-            else:
-                posterior = model.encode(imgs)
 
-            z = posterior.sample()  # (B, C, H', W')
+                z = posterior.sample()  # (B, C, H', W')
 
-            # Flatten spatial: average over spatial dims
-            z_flat = z.view(z.size(0), z.size(1), -1).mean(dim=2)  # (B, C)
-            latents.append(z_flat.cpu())
-
-            # Store spatial latents and images for first 100 samples
-            if samples_processed < 100:
                 latents_spatial.append(z.cpu())
                 images.append(imgs.cpu())
 
-            samples_processed += imgs.size(0)
-            
-            # Update progress bar description with current count
-            pbar.set_description(f"Extracting latents [{min(samples_processed, num_samples)}/{num_samples}]")
+                samples_processed += imgs.size(0)
+        
+        if latents_spatial:
+            results[subcat_name] = {
+                'latents_spatial': torch.cat(latents_spatial, dim=0)[:num_samples_per_subcat].numpy(),
+                'images': torch.cat(images, dim=0)[:num_samples_per_subcat].numpy(),
+            }
+    
+    return results
 
-    return {
-        'latents': torch.cat(latents, dim=0)[:num_samples].numpy(),
-        'latents_spatial': torch.cat(latents_spatial, dim=0)[:min(100, num_samples)].numpy() if latents_spatial else None,
-        'images': torch.cat(images, dim=0)[:min(100, num_samples)].numpy() if images else None,
-    }
 
-
-def visualize_latents(latents_spatial, images, save_dir):
-    """Create latent visualization showing input images and all latent channels.
+def visualize_latents_by_subcategory(data_by_subcat, save_dir, n_samples_per_subcat=5):
+    """Create latent visualization showing samples from multiple subcategories.
 
     Args:
-        latents_spatial: (N, C, H, W) numpy array of spatial latents (optional)
-        images: (N, 3, H, W) numpy array of images (optional)
+        data_by_subcat: Dict mapping subcategory name to dict with latents_spatial and images
         save_dir: Directory to save outputs
+        n_samples_per_subcat: Number of samples to show per subcategory
     """
     save_dir = Path(save_dir)
 
-    if latents_spatial is None or images is None:
-        print("  Warning: No spatial latents or images available for visualization")
+    if not data_by_subcat:
+        print("  Warning: No data available for visualization")
         return
 
-    n_samples = min(8, latents_spatial.shape[0])
-    n_channels = latents_spatial.shape[1]
+    subcategories = list(data_by_subcat.keys())
+    n_subcats = len(subcategories)
+    
+    # Get number of latent channels from first subcategory
+    first_subcat = subcategories[0]
+    n_channels = data_by_subcat[first_subcat]['latents_spatial'].shape[1]
+    
+    # Create figure: (1 + n_channels) rows per subcategory, n_samples_per_subcat columns
+    n_rows_per_subcat = 1 + n_channels  # input + each latent channel
+    total_rows = n_subcats * n_rows_per_subcat
+    
+    fig, axes = plt.subplots(total_rows, n_samples_per_subcat, 
+                              figsize=(n_samples_per_subcat * 2.5, total_rows * 2))
+    
+    # Handle case where axes might be 1D
+    if total_rows == 1:
+        axes = axes.reshape(1, -1)
+    if n_samples_per_subcat == 1:
+        axes = axes.reshape(-1, 1)
 
-    # Create figure: 1 + n_channels rows (input images + each latent channel)
-    n_rows = 1 + n_channels
-    fig, axes = plt.subplots(n_rows, n_samples, figsize=(n_samples * 2.5, n_rows * 2.5))
-
-    for i in range(n_samples):
-        # Row 0: Input image
-        img = images[i]
-        img = (img * 0.5 + 0.5)  # Denormalize from [-1, 1] to [0, 1]
-        img = np.clip(img, 0, 1)
-        img = np.transpose(img, (1, 2, 0))
-        axes[0, i].imshow(img)
-        axes[0, i].axis('off')
-        axes[0, i].set_title(f'Sample {i}', fontsize=10)
-
-        # Rows 1 to n_channels: Individual latent channels
+    for subcat_idx, subcat_name in enumerate(subcategories):
+        subcat_data = data_by_subcat[subcat_name]
+        images = subcat_data['images']
+        latents_spatial = subcat_data['latents_spatial']
+        
+        n_available = min(n_samples_per_subcat, images.shape[0])
+        base_row = subcat_idx * n_rows_per_subcat
+        
+        for i in range(n_samples_per_subcat):
+            if i < n_available:
+                # Row 0: Input image
+                img = images[i]
+                img = (img * 0.5 + 0.5)  # Denormalize from [-1, 1] to [0, 1]
+                img = np.clip(img, 0, 1)
+                img = np.transpose(img, (1, 2, 0))
+                axes[base_row, i].imshow(img)
+                
+                # Rows 1 to n_channels: Individual latent channels
+                for c in range(n_channels):
+                    lat_channel = latents_spatial[i, c]  # (H, W)
+                    vmin, vmax = np.percentile(lat_channel, [2, 98])
+                    lat_norm = np.clip((lat_channel - vmin) / (vmax - vmin + 1e-8), 0, 1)
+                    axes[base_row + c + 1, i].imshow(lat_norm, cmap='viridis')
+            
+            # Turn off axes for all
+            for row_offset in range(n_rows_per_subcat):
+                axes[base_row + row_offset, i].axis('off')
+        
+        # Add y-labels for the first column
+        axes[base_row, 0].set_ylabel(f'{subcat_name}\nInput', fontsize=10)
         for c in range(n_channels):
-            lat_channel = latents_spatial[i, c]  # (H, W)
-            # Normalize each channel independently for visualization
-            vmin, vmax = np.percentile(lat_channel, [2, 98])
-            lat_norm = np.clip((lat_channel - vmin) / (vmax - vmin + 1e-8), 0, 1)
-            axes[c + 1, i].imshow(lat_norm, cmap='viridis')
-            axes[c + 1, i].axis('off')
+            axes[base_row + c + 1, 0].set_ylabel(f'Ch {c}', fontsize=10)
+        
+        # Re-enable y-axis label display
+        for row_offset in range(n_rows_per_subcat):
+            axes[base_row + row_offset, 0].yaxis.set_visible(True)
+            axes[base_row + row_offset, 0].yaxis.label.set_visible(True)
+        
+        # Add title for first sample of each subcategory
+        if subcat_idx == 0:
+            for i in range(n_samples_per_subcat):
+                axes[base_row, i].set_title(f'Sample {i}', fontsize=10)
 
-    # Add y-labels for the first column
-    axes[0, 0].set_ylabel('Input', fontsize=12)
-    for c in range(n_channels):
-        axes[c + 1, 0].set_ylabel(f'Latent Ch {c}', fontsize=12)
-
-    # Re-enable the y-axis label display (axis was turned off)
-    for row in range(n_rows):
-        axes[row, 0].yaxis.set_visible(True)
-        axes[row, 0].yaxis.label.set_visible(True)
-
-    plt.suptitle(f'Input Images and Latent Channels (C={n_channels})', fontsize=14, fontweight='bold')
+    plt.suptitle(f'Latent Samples by Subcategory ({n_subcats} subcategories, C={n_channels})', 
+                 fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_dir / 'latent_samples.png', dpi=150, bbox_inches='tight')
     plt.close()
     print(f"  Saved latent_samples.png")
 
 
-def visualize_latent_pca(latents_spatial, images, save_dir):
-    """Create 2D PCA visualization of spatial latents.
-
-    Applies PCA per-image to reduce 4-channel latents to 3 channels (RGB) for visualization.
-    Shows input images alongside their PCA-reduced latent representations.
+def visualize_latent_pca_by_subcategory(data_by_subcat, save_dir, n_samples_per_subcat=5):
+    """Create PCA visualization showing samples from multiple subcategories.
 
     Args:
-        latents_spatial: (N, C, H, W) numpy array of spatial latents
-        images: (N, 3, H, W) numpy array of input images
+        data_by_subcat: Dict mapping subcategory name to dict with latents_spatial and images
         save_dir: Directory to save outputs
+        n_samples_per_subcat: Number of samples to show per subcategory
     """
     save_dir = Path(save_dir)
 
-    if latents_spatial is None or images is None:
-        print("  Warning: No spatial latents available for PCA visualization")
+    if not data_by_subcat:
+        print("  Warning: No data available for PCA visualization")
         return
 
-    n_samples, n_channels, h, w = latents_spatial.shape
-    n_show = min(8, n_samples)  # Show up to 8 samples
-
-    # Create figure: 3 rows (input, raw latent ch0-2, PCA latent)
-    fig, axes = plt.subplots(3, n_show, figsize=(n_show * 3, 9))
+    subcategories = list(data_by_subcat.keys())
+    n_subcats = len(subcategories)
+    
+    # Get dimensions from first subcategory
+    first_subcat = subcategories[0]
+    n_channels = data_by_subcat[first_subcat]['latents_spatial'].shape[1]
+    
+    # Create figure: 3 rows per subcategory (input, raw latent, PCA)
+    n_rows_per_subcat = 3
+    total_rows = n_subcats * n_rows_per_subcat
+    
+    fig, axes = plt.subplots(total_rows, n_samples_per_subcat, 
+                              figsize=(n_samples_per_subcat * 2.5, total_rows * 2.5))
+    
+    if total_rows == 1:
+        axes = axes.reshape(1, -1)
+    if n_samples_per_subcat == 1:
+        axes = axes.reshape(-1, 1)
 
     all_explained_variance = []
 
-    for i in range(n_show):
-        # Row 1: Input image
-        img = images[i]
-        img = (img * 0.5 + 0.5)  # Denormalize from [-1, 1] to [0, 1]
-        img = np.clip(img, 0, 1)
-        img = np.transpose(img, (1, 2, 0))
-        axes[0, i].imshow(img)
-        axes[0, i].axis('off')
-        if i == 0:
-            axes[0, i].set_ylabel('Input', fontsize=12)
-        axes[0, i].set_title(f'Sample {i}', fontsize=10)
+    for subcat_idx, subcat_name in enumerate(subcategories):
+        subcat_data = data_by_subcat[subcat_name]
+        images = subcat_data['images']
+        latents_spatial = subcat_data['latents_spatial']
+        
+        n_available = min(n_samples_per_subcat, images.shape[0])
+        _, _, h, w = latents_spatial.shape
+        base_row = subcat_idx * n_rows_per_subcat
+        
+        for i in range(n_samples_per_subcat):
+            if i < n_available:
+                # Row 0: Input image
+                img = images[i]
+                img = (img * 0.5 + 0.5)
+                img = np.clip(img, 0, 1)
+                img = np.transpose(img, (1, 2, 0))
+                axes[base_row, i].imshow(img)
 
-        # Row 2: Raw latent (first 3 channels as RGB)
-        lat_raw = latents_spatial[i][:3]  # (3, H, W)
-        lat_raw = np.transpose(lat_raw, (1, 2, 0))  # (H, W, 3)
-        lat_raw = (lat_raw - lat_raw.min()) / (lat_raw.max() - lat_raw.min() + 1e-8)
-        axes[1, i].imshow(lat_raw)
-        axes[1, i].axis('off')
-        if i == 0:
-            axes[1, i].set_ylabel('Latent (Ch 0-2)', fontsize=12)
+                # Row 1: Raw latent (first 3 channels as RGB)
+                lat_raw = latents_spatial[i][:3]
+                lat_raw = np.transpose(lat_raw, (1, 2, 0))
+                lat_raw = (lat_raw - lat_raw.min()) / (lat_raw.max() - lat_raw.min() + 1e-8)
+                axes[base_row + 1, i].imshow(lat_raw)
 
-        # Row 3: PCA latent - apply PCA per image
-        # Reshape single image latent: (C, H, W) -> (H*W, C)
-        lat_single = latents_spatial[i]  # (C, H, W)
-        lat_flat = lat_single.transpose(1, 2, 0).reshape(-1, n_channels)  # (H*W, C)
+                # Row 2: PCA latent
+                lat_single = latents_spatial[i]
+                lat_flat = lat_single.transpose(1, 2, 0).reshape(-1, n_channels)
 
-        # Fit PCA on this single image's latent
-        pca = PCA(n_components=3)
-        lat_pca_flat = pca.fit_transform(lat_flat)  # (H*W, 3)
-        all_explained_variance.append(pca.explained_variance_ratio_)
+                pca = PCA(n_components=3)
+                lat_pca_flat = pca.fit_transform(lat_flat)
+                all_explained_variance.append(pca.explained_variance_ratio_)
 
-        # Reshape back: (H*W, 3) -> (H, W, 3)
-        lat_pca = lat_pca_flat.reshape(h, w, 3)
+                lat_pca = lat_pca_flat.reshape(h, w, 3)
+                lat_pca_norm = np.zeros_like(lat_pca)
+                for c in range(3):
+                    channel = lat_pca[..., c]
+                    vmin, vmax = np.percentile(channel, [2, 98])
+                    lat_pca_norm[..., c] = np.clip((channel - vmin) / (vmax - vmin + 1e-8), 0, 1)
 
-        # Normalize to [0, 1] for visualization
-        lat_pca_norm = np.zeros_like(lat_pca)
-        for c in range(3):
-            channel = lat_pca[..., c]
-            vmin, vmax = np.percentile(channel, [2, 98])
-            lat_pca_norm[..., c] = np.clip((channel - vmin) / (vmax - vmin + 1e-8), 0, 1)
-
-        axes[2, i].imshow(lat_pca_norm)
-        axes[2, i].axis('off')
-        if i == 0:
-            axes[2, i].set_ylabel('Latent PCA', fontsize=12)
+                axes[base_row + 2, i].imshow(lat_pca_norm)
+            
+            # Turn off axes
+            for row_offset in range(n_rows_per_subcat):
+                axes[base_row + row_offset, i].axis('off')
+        
+        # Add y-labels
+        axes[base_row, 0].set_ylabel(f'{subcat_name}\nInput', fontsize=10)
+        axes[base_row + 1, 0].set_ylabel('Latent', fontsize=10)
+        axes[base_row + 2, 0].set_ylabel('PCA', fontsize=10)
+        
+        for row_offset in range(n_rows_per_subcat):
+            axes[base_row + row_offset, 0].yaxis.set_visible(True)
+            axes[base_row + row_offset, 0].yaxis.label.set_visible(True)
+        
+        if subcat_idx == 0:
+            for i in range(n_samples_per_subcat):
+                axes[base_row, i].set_title(f'Sample {i}', fontsize=10)
 
     # Compute average explained variance
-    avg_var = np.mean(all_explained_variance, axis=0)
-    var_text = f"Avg PCA explained variance: PC1={avg_var[0]:.1%}, PC2={avg_var[1]:.1%}, PC3={avg_var[2]:.1%}"
-    fig.suptitle(f'Latent Space PCA Visualization (per-image)\n{var_text}', fontsize=14, fontweight='bold')
+    if all_explained_variance:
+        avg_var = np.mean(all_explained_variance, axis=0)
+        var_text = f"Avg PCA explained variance: PC1={avg_var[0]:.1%}, PC2={avg_var[1]:.1%}, PC3={avg_var[2]:.1%}"
+    else:
+        var_text = ""
+    
+    fig.suptitle(f'Latent Space PCA by Subcategory ({n_subcats} subcategories)\n{var_text}', 
+                 fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_dir / 'latent_pca.png', dpi=150, bbox_inches='tight')
     plt.close()
@@ -480,8 +555,10 @@ def parse_args():
                         help="Force vanilla SD architecture (ch=128, ch_mult=[1,2,4,4])")
 
     # Visualization options
-    parser.add_argument("--num_samples", type=int, default=1000,
-                        help="Number of samples for latent extraction")
+    parser.add_argument("--num_subcategories", type=int, default=5,
+                        help="Number of subcategories to visualize")
+    parser.add_argument("--num_samples_per_subcat", type=int, default=5,
+                        help="Number of samples per subcategory")
     parser.add_argument("--image_size", type=int, default=256,
                         help="Input image size")
     parser.add_argument("--batch_size", type=int, default=16,
@@ -516,54 +593,75 @@ def main():
     model = model.to(device)
     model.eval()
 
-    # Load dataset
-    print(f"\nLoading {args.dataset_type} dataset from: {args.data_dir}")
-    crop_images = not args.no_crop
-    print(f"  Crop images: {crop_images}")
-    dataset_kwargs = {"image_size": args.image_size, "crop_images": crop_images}
-
     # Set default bb_file if not provided
     if args.dataset_type in ["co3d", "warp_co3d"] and args.bb_file is None:
         args.bb_file = "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
         print(f"  Using default bb_file: {args.bb_file}")
 
-    dataset = load_dataset(
-        dataset_type=args.dataset_type,
-        data_dir=args.data_dir,
-        bb_file=args.bb_file,
-        **dataset_kwargs
+    # Discover subcategories
+    print(f"\nDiscovering subcategories from: {args.bb_file}")
+    subcategories = get_subcategories_from_bb_file(args.bb_file, min_samples=args.num_samples_per_subcat)
+    print(f"  Found {len(subcategories)} subcategories with >= {args.num_samples_per_subcat} samples")
+    
+    # Select subset of subcategories
+    selected_subcats = subcategories[:args.num_subcategories]
+    print(f"  Selected subcategories: {selected_subcats}")
+
+    # Load datasets for each subcategory
+    print(f"\nLoading datasets for {len(selected_subcats)} subcategories...")
+    crop_images = not args.no_crop
+    
+    # Create temporary bb files for each subcategory
+    datasets_by_subcat = {}
+    
+    # Load full bb file
+    with gzip.GzipFile(args.bb_file, "rb") as f:
+        full_obj_dict = json.loads(cast(IO, f).read().decode("utf8"))
+    
+    for subcat_name in selected_subcats:
+        # Create a temporary dict with just this subcategory
+        subcat_dict = {subcat_name: full_obj_dict[subcat_name]}
+        
+        # Write temporary bb file
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='wb', suffix='.jgz', delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            with gzip.GzipFile(fileobj=tmp_file, mode='wb') as gz:
+                gz.write(json.dumps(subcat_dict).encode('utf8'))
+        
+        try:
+            dataset = load_dataset(
+                dataset_type=args.dataset_type,
+                data_dir=args.data_dir,
+                bb_file=tmp_path,
+                image_size=args.image_size,
+                crop_images=crop_images,
+            )
+            datasets_by_subcat[subcat_name] = dataset
+            print(f"    {subcat_name}: {len(dataset)} samples")
+        finally:
+            os.unlink(tmp_path)
+
+    # Extract latents by subcategory
+    print(f"\nExtracting latents ({args.num_samples_per_subcat} samples per subcategory)...")
+    data_by_subcat = extract_latents_by_subcategory(
+        model, datasets_by_subcat, args.num_samples_per_subcat, device
     )
-    print(f"  Dataset size: {len(dataset)}")
-
-
-    from torch.utils.data import DataLoader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
-
-    # Extract latents
-    print(f"\nExtracting latents from {args.num_samples} samples...")
-    latent_data = extract_latents(model, dataloader, args.num_samples, device)
-    print(f"  Extracted latents shape: {latent_data['latents'].shape}")
 
     # Generate visualizations
     print("\nGenerating latent visualization...")
-    visualize_latents(
-        latents_spatial=latent_data['latents_spatial'],
-        images=latent_data['images'],
-        save_dir=output_dir
+    visualize_latents_by_subcategory(
+        data_by_subcat=data_by_subcat,
+        save_dir=output_dir,
+        n_samples_per_subcat=args.num_samples_per_subcat
     )
 
     if not args.skip_pca:
         print("\nGenerating PCA visualization...")
-        visualize_latent_pca(
-            latents_spatial=latent_data['latents_spatial'],
-            images=latent_data['images'],
-            save_dir=output_dir
+        visualize_latent_pca_by_subcategory(
+            data_by_subcat=data_by_subcat,
+            save_dir=output_dir,
+            n_samples_per_subcat=args.num_samples_per_subcat
         )
 
     # Summary
@@ -573,6 +671,7 @@ def main():
     print("  - latent_samples.png")
     if not args.skip_pca:
         print("  - latent_pca.png")
+    print(f"Visualized {len(selected_subcats)} subcategories: {selected_subcats}")
     print("=" * 60)
 
 
