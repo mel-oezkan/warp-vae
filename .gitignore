@@ -37,4 +37,7 @@ lightning_logs/evaluation_outputs/
 lightning_logs/
 evaluation_outputs/
 *.ipynb
+**.ipynb
+*/*/*.ipynb
+evaluation/notebooks/*
 eval_outputs/
