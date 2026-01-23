@@ -36,14 +36,15 @@ trainer:
   target: src.trainer.vae_trainers.WarpVAETrainer
   params:
     target_key: "image_target"
-    warp_consistency_weight: 0.5
+    warp_consistency_weight: 1.0
     warp_reconstruction_weight: 0.0
     consistency_loss_type: "l1"
     bidirectional: true
     confidence_weighted: true
-    confidence_threshold: 0.1
+    loss_confidence_threshold: 0.1
     warmup_steps: 1000
-    vanilla_probability: 0.45
+    vanilla_probability: 0.2
+    gradient_accumulation_steps: ${training.gradient_accumulation_steps}
 
 data:
   target: src.data.datamodule.VAEDataModule
@@ -58,7 +59,7 @@ data:
         pair_sampling: "random"
         max_pair_distance: 10
         warp_resolution: ${training.image_size}
-        confidence_threshold: 0.5
+        warp_confidence_threshold: 0.75
         include_plucker: false
     batch_size: ${training.batch_size}
     val_split: ${training.val_split}
@@ -81,6 +82,7 @@ training:
   output_dir: "./outputs/warp_vae_co3d_small"
   checkpoint_every_n_epochs: 2
   log_every_n_steps: 10
+  gradient_accumulation_steps: 1          # Accumulate gradients over N batches before updating
 
 wandb:
   enabled: true

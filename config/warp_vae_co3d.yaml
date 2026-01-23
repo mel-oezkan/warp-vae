@@ -36,14 +36,15 @@ trainer:
   target: src.trainer.vae_trainers.WarpVAETrainer
   params:
     target_key: "image_target"
-    warp_consistency_weight: 0.5
+    warp_consistency_weight: 1.0
     warp_reconstruction_weight: 0.0
     consistency_loss_type: "l1"
     bidirectional: true
     confidence_weighted: true
-    confidence_threshold: 0.1
+    loss_confidence_threshold: 0.1
     warmup_steps: 5000
-    vanilla_probability: 0.0
+    vanilla_probability: 0.2
+    gradient_accumulation_steps: ${training.gradient_accumulation_steps}
 
 data:
   target: src.data.datamodule.VAEDataModule
@@ -55,32 +56,34 @@ data:
         bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
         image_size: ${training.image_size}
         romav2_setting: "turbo"
+        # romav2_device: "cuda:1"           # Model parallelism disabled - RoMaV2 converts PIL internally
         pair_sampling: "random"
         max_pair_distance: 20
         warp_resolution: ${training.image_size}
-        confidence_threshold: 0.5
+        warp_confidence_threshold: 0.75
         include_plucker: false
     batch_size: ${training.batch_size}
     val_split: ${training.val_split}
     num_workers: ${training.num_workers}
-    pin_memory: true
-    persistent_workers: true
+    pin_memory: false                       # Disabled since num_workers=0
+    persistent_workers: false               # Must be false when num_workers=0
     shuffle_train: true
 
 training:
-  batch_size: 2
+  batch_size: 2                             # Max for GTX 1080 Ti with full SD-VAE architecture
   image_size: 256
-  num_workers: 4
+  num_workers: 0                            # Must be 0 for RoMaV2 (CUDA in dataloader workers)
   val_split: 0.1
   num_epochs: 50
   lr: 4.5e-6
   kl_weight: 0.000001
   lpips_loss_weight: 1.0
   ema_decay: 0.9999
-  precision: 16
+  precision: 16                             # Mixed precision to reduce memory
   output_dir: "./outputs/warp_vae_co3d"
   checkpoint_every_n_epochs: 5
   log_every_n_steps: 50
+  gradient_accumulation_steps: 8            # Accumulate gradients over N batches before updating
 
 wandb:
   enabled: true
