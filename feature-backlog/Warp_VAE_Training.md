@@ -302,10 +302,23 @@ data:
 
 ### 2. Memory Considerations
 
-- RoMaV2 model: ~2-4GB VRAM
-- VAE model: ~2-3GB VRAM
-- Training batch: ~2-4GB VRAM
-- **Total**: ~8-10GB per GPU (fits on GTX 1080 Ti with small config)
+**Small Model (warp_vae_co3d_small):**
+- VAE model (ch=64): ~0.1GB VRAM
+- RoMaV2 model: ~2GB VRAM
+- Training batch (bs=8, 128×128): ~3GB VRAM
+- **Total**: ~5-6GB per GPU
+
+**Full Model (warp_vae_co3d):**
+- VAE model (ch=128): ~0.3GB VRAM
+- RoMaV2 model: ~2GB VRAM
+- Training batch (bs=2, 256×256): ~6GB VRAM
+- **Total**: ~8-10GB per GPU (fits on GTX 1080 Ti)
+
+| Config | Batch Size | Peak VRAM (training) |
+|--------|------------|----------------------|
+| `warp_vae_co3d_small` | 8 | ~5GB |
+| `warp_vae_co3d` | 2 | ~8GB |
+| `warp_vae_co3d` | 4 | OOM on 11GB |
 
 ### 3. Warp Warmup
 
@@ -330,6 +343,55 @@ warp_latent = F.interpolate(
     mode="bilinear"
 ).permute(0, 2, 3, 1)  # [B, 32, 32, 2]
 ```
+
+### 5. FP16 Numerical Stability
+
+When training with mixed precision (`precision: 16`), several measures are required to prevent NaN losses:
+
+#### Gradient Clipping
+
+The trainer uses **manual optimization** (dual optimizers for autoencoder and discriminator), which means PyTorch Lightning's `gradient_clip_val` parameter cannot be used. Instead, gradient clipping is applied manually after `manual_backward()`:
+
+```python
+# In WarpVAETrainer.training_step():
+
+# Autoencoder optimization with gradient clipping
+opt_ae.zero_grad()
+self.manual_backward(total_ae_loss)
+torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+opt_ae.step()
+
+# Discriminator optimization with gradient clipping
+opt_disc.zero_grad()
+self.manual_backward(discloss)
+torch.nn.utils.clip_grad_norm_(self.model.loss.discriminator.parameters(), max_norm=1.0)
+opt_disc.step()
+```
+
+#### Logvar Clamping in Loss Function
+
+The `LPIPSWithDiscriminator` loss function computes NLL loss using a learned `logvar` parameter. Without clamping, extreme `logvar` values can cause overflow/underflow in FP16:
+
+```python
+# In ldm/modules/losses/contperceptual.py:
+
+# Clamp logvar to prevent extreme values that cause overflow/underflow
+logvar_clamped = torch.clamp(self.logvar.float(), min=-10.0, max=10.0)
+nll_loss = rec_loss.float() / torch.exp(logvar_clamped) + logvar_clamped
+```
+
+**Why this matters:**
+- If `logvar` becomes very negative (e.g., -20), `torch.exp(logvar)` is ~1e-9
+- Dividing `rec_loss` by this tiny value causes overflow in FP16 (max ~65504)
+- The clamping range `[-10, 10]` keeps `exp(logvar)` in a safe range (~4.5e-5 to ~22026)
+
+#### Summary of FP16 Stability Fixes
+
+| Issue | Symptom | Fix |
+|-------|---------|-----|
+| Exploding gradients | NaN loss after many steps | Manual gradient clipping (max_norm=1.0) |
+| Logvar overflow | NaN in nll_loss computation | Clamp logvar to [-10, 10] |
+| FP16 precision loss | Accumulated errors | Cast rec_loss to float32 before division |
 
 ## Evaluation
 
@@ -392,15 +454,37 @@ The script produces 4 visualizations saved to `./eval_outputs/`:
 - Auto-detects latest checkpoint in `./outputs/warp_vae_co3d_small/` if none specified
 - Handles checkpoint format variations (strips `model.` prefix if present)
 - Disables `torch.compile` for older GPU compatibility
-## Training Command
+## Training Commands
 
+### Small Model (ch=64, for testing/limited VRAM)
 ```bash
-# Single GPU
-CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_co3d_small
-
-# Multi-GPU (DDP)
-CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_co3d_small
+# Small model at 128x128
+python train.py --config-name=warp_vae_co3d_small
 ```
+
+### Full SD-VAE 2.1 Architecture (ch=128, production)
+```bash
+# Full SD-VAE architecture at 256x256
+# Requires ~11GB VRAM per GPU (fits on GTX 1080 Ti with batch_size=2)
+python train.py --config-name=warp_vae_co3d
+```
+
+### Specifying GPUs (optional)
+```bash
+# Use specific GPU(s)
+CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_co3d
+CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_co3d
+```
+
+## Model Architecture Comparison
+
+| Config | ch | ch_mult | z_channels | Downsampling | Image Size | Latent Size | Params |
+|--------|-----|---------|------------|--------------|------------|-------------|--------|
+| `warp_vae_co3d_small` | 64 | [1,2,4] | 4 | 8× | 128×128 | 16×16×4 | ~21M |
+| `warp_vae_co3d` | 128 | [1,2,4,4] | 4 | 8× | 256×256 | 32×32×4 | ~84M |
+| SD-VAE 2.1 (reference) | 128 | [1,2,4,4] | 4 | 8× | 768×768 | 96×96×4 | ~84M |
+
+**Note:** The `warp_vae_co3d` config matches the SD-VAE 2.1 architecture exactly, just trained at 256×256 resolution for memory constraints.
 
 ## Expected Results
 
@@ -429,5 +513,7 @@ CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_co3d_small
 | `src/data/warp_dataset.py` | WarpCO3DDataset with RoMaV2 warps |
 | `src/losses/warp_consistency.py` | Warp consistency loss functions |
 | `src/trainer/vae_trainers.py` | WarpVAETrainer class |
-| `config/warp_vae_co3d_small.yaml` | Training configuration |
+| `config/warp_vae_co3d_small.yaml` | Small model config (ch=64, 128×128) |
+| `config/warp_vae_co3d.yaml` | Full SD-VAE config (ch=128, 256×256) |
 | `eval_warp_vae.py` | Evaluation and visualization |
+| `compare_latents.py` | Compare latent representations across models |
