@@ -410,9 +410,11 @@ class WarpVAETrainer(BaseVAETrainer):
         consistency_loss_type: str = "l1",
         bidirectional: bool = True,
         confidence_weighted: bool = True,
-        confidence_threshold: float = 0.1,
+        loss_confidence_threshold: float = 0.1,
         warmup_steps: int = 0,
         vanilla_probability: float = 0.0,
+        # Gradient accumulation
+        gradient_accumulation_steps: int = 1,
     ):
         """
         Initialize Warp VAE trainer.
@@ -431,9 +433,10 @@ class WarpVAETrainer(BaseVAETrainer):
             consistency_loss_type: Type of consistency loss ("l1", "l2", "cosine")
             bidirectional: Compute loss in both directions (A->B and B->A)
             confidence_weighted: Weight loss by RoMaV2 confidence
-            confidence_threshold: Minimum confidence for loss computation
+            loss_confidence_threshold: Minimum confidence for loss computation
             warmup_steps: Steps before enabling warp loss (for stability)
             vanilla_probability: Probability of using vanilla loss only (no warp loss)
+            gradient_accumulation_steps: Number of batches to accumulate before updating
         """
         super().__init__(
             model_config=model_config,
@@ -455,7 +458,7 @@ class WarpVAETrainer(BaseVAETrainer):
             loss_type=consistency_loss_type,
             bidirectional=bidirectional,
             confidence_weighted=confidence_weighted,
-            confidence_threshold=confidence_threshold,
+            confidence_threshold=loss_confidence_threshold,
         )
 
         # Optional warp reconstruction loss
@@ -470,6 +473,9 @@ class WarpVAETrainer(BaseVAETrainer):
         # Probability of using vanilla loss only (skipping warp loss)
         self.vanilla_probability = vanilla_probability
 
+        # Gradient accumulation
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+
         print("[WarpVAETrainer] Initialized with:")
         print(f"  - warp_consistency_weight={warp_consistency_weight}")
         print(f"  - warp_reconstruction_weight={warp_reconstruction_weight}")
@@ -477,6 +483,7 @@ class WarpVAETrainer(BaseVAETrainer):
         print(f"  - bidirectional={bidirectional}")
         print(f"  - warmup_steps={warmup_steps}")
         print(f"  - vanilla_probability={vanilla_probability}")
+        print(f"  - gradient_accumulation_steps={gradient_accumulation_steps}")
 
     def _get_model_output(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Any]:
         """
@@ -581,15 +588,23 @@ class WarpVAETrainer(BaseVAETrainer):
 
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         """
-        Training step with warp consistency.
+        Training step with warp consistency and gradient accumulation.
 
         Processes paired images and enforces latent space consistency
         across views using RoMaV2 correspondences.
 
         With probability `vanilla_probability`, the warp loss is skipped
         and only the vanilla VAE loss is used.
+
+        Gradient accumulation: Accumulates gradients over multiple batches
+        before performing an optimizer step, effectively increasing the
+        batch size without increasing memory usage.
         """
         opt_ae, opt_disc = self.optimizers()
+
+        # Determine if this is an accumulation step or update step
+        is_accumulating = (batch_idx + 1) % self.gradient_accumulation_steps != 0
+        accum_steps = self.gradient_accumulation_steps
 
         # Get source image and encoding
         inputs = self.get_input(batch, self.image_key)
@@ -628,12 +643,18 @@ class WarpVAETrainer(BaseVAETrainer):
 
         total_ae_loss = aeloss + warp_loss
 
-        # Optimize autoencoder
-        opt_ae.zero_grad()
-        self.manual_backward(total_ae_loss)
-        opt_ae.step()
+        # Scale loss for gradient accumulation
+        scaled_ae_loss = total_ae_loss / accum_steps
 
-        # Log losses
+        # Backward pass (accumulates gradients)
+        self.manual_backward(scaled_ae_loss)
+
+        # Only step optimizer after accumulating enough gradients
+        if not is_accumulating:
+            opt_ae.step()
+            opt_ae.zero_grad()
+
+        # Log losses (unscaled for interpretability)
         self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
         self.log("train/warp_loss", warp_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
         self.log("train/total_ae_loss", total_ae_loss, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=False)
@@ -659,9 +680,16 @@ class WarpVAETrainer(BaseVAETrainer):
             split="train",
         )
 
-        opt_disc.zero_grad()
-        self.manual_backward(discloss)
-        opt_disc.step()
+        # Scale discriminator loss for gradient accumulation
+        scaled_disc_loss = discloss / accum_steps
+
+        # Backward pass (accumulates gradients)
+        self.manual_backward(scaled_disc_loss)
+
+        # Only step optimizer after accumulating enough gradients
+        if not is_accumulating:
+            opt_disc.step()
+            opt_disc.zero_grad()
 
         self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
         self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
