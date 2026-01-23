@@ -70,6 +70,7 @@ class LPIPSWithDiscriminator(nn.Module):
         d_weight = torch.norm(nll_grads.detach()) / (
             torch.norm(g_grads.detach()) + 1e-4
         )
+        
         d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
         d_weight = d_weight * self.discriminator_weight
         return d_weight
@@ -95,7 +96,9 @@ class LPIPSWithDiscriminator(nn.Module):
             rec_loss = rec_loss + self.perceptual_weight * p_loss
 
         # Keep logvar computation in FP32 for stability with very small values
-        nll_loss = rec_loss / torch.exp(self.logvar.float()) + self.logvar.float()
+        # Clamp logvar to prevent extreme values that cause overflow/underflow
+        logvar_clamped = torch.clamp(self.logvar.float(), min=-10.0, max=10.0)
+        nll_loss = rec_loss.float() / torch.exp(logvar_clamped) + logvar_clamped
         weighted_nll_loss = nll_loss
         if weights is not None:
             weighted_nll_loss = weights * nll_loss
