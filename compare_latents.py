@@ -24,7 +24,8 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# CUDA_VISIBLE_DEVICES should be set externally, not hardcoded
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import torch
 import torch.nn.functional as F
@@ -129,32 +130,20 @@ def load_model(checkpoint_path, config_path, model_type="auto"):
 
     # Load model based on type
     if model_type == "diffusers":
-        with open(config_path_str, 'r') as f:
-            config = json.load(f)
-        
-        from ldm.models.autoencoder import AutoencoderKL
-        block_out_channels = config.get('block_out_channels', [128, 256, 512, 512])
-        ch = block_out_channels[0]
-        ch_mult = [c // ch for c in block_out_channels]
-        
-        ddconfig = {
-            "double_z": True,
-            "z_channels": config.get('latent_channels', 4),
-            "resolution": config.get('sample_size', 256),
-            "in_channels": config.get('in_channels', 3),
-            "out_ch": config.get('out_channels', 3),
-            "ch": ch,
-            "ch_mult": ch_mult,
-            "num_res_blocks": config.get('layers_per_block', 2),
-            "attn_resolutions": [],
-            "dropout": 0.0,
-        }
-        
-        model = AutoencoderKL(
-            ddconfig=ddconfig,
-            lossconfig={"target": "torch.nn.Identity"},
-            embed_dim=ddconfig['z_channels'],
-        )
+        # For diffusers format, load using diffusers library directly
+        # This handles the different weight naming conventions properly
+        if not DIFFUSERS_AVAILABLE:
+            raise ImportError("diffusers package required for loading diffusers-format models")
+
+        # Get the directory containing config.json and safetensors
+        checkpoint_dir = Path(checkpoint_path_str).parent
+        print(f"  Loading diffusers VAE from directory: {checkpoint_dir}")
+
+        model = DiffusersVAE.from_pretrained(str(checkpoint_dir))
+        print("  Diffusers VAE loaded successfully")
+
+        # Return early - diffusers models don't need state_dict loading
+        return model, "sdvae"
         
     elif model_type == "eqvae":
         from omegaconf import OmegaConf
@@ -338,8 +327,10 @@ def decode_latents(model, latents, device, model_type="ldm"):
     latents = latents.to(device)
 
     if model_type == "sdvae":
-        # Diffusers VAE decode expects unscaled latents
-        recon = model.decode(latents).sample
+        # Diffusers VAE expects scaled latents for decoding
+        scaling_factor = getattr(model.config, 'scaling_factor', 0.18215)
+        latents_scaled = latents / scaling_factor
+        recon = model.decode(latents_scaled).sample
     else:
         if hasattr(model, 'ema_scope') and hasattr(model, 'model_ema') and model.model_ema is not None:
             with model.ema_scope():
