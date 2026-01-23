@@ -34,16 +34,26 @@ def get_vae_weights(input_path):
     return vae_weight
 
 
-def get_device_config():
+def get_device_config(force_single_gpu: bool = False, training_device: int = 0):
+    """Get device configuration for training.
+
+    Args:
+        force_single_gpu: If True, use only one GPU even if multiple are available.
+                         This is useful for model parallelism where RoMaV2 runs on
+                         a different GPU than the VAE training.
+        training_device: Which GPU to use for training (default: 0).
+    """
     n_gpus = len(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(","))
     devices = torch.cuda.device_count()
 
     # Use DDP strategy with find_unused_parameters for multi-GPU training
     # This is needed because EMA buffers are not used in forward pass
-    if devices > 1:
+    if devices > 1 and not force_single_gpu:
         from pytorch_lightning.strategies import DDPStrategy
         strategy = DDPStrategy(find_unused_parameters=True)
     else:
+        # Single GPU mode - use specified device
+        devices = [training_device] if torch.cuda.is_available() else 1
         strategy = "auto"
 
     return n_gpus, devices, strategy
@@ -99,11 +109,14 @@ def setup_trainer_module(cfg: DictConfig, log_dir: str, use_wandb: bool):
         trainer_class = get_obj_from_str(cfg.trainer.target)
 
         # Instantiate trainer with model_config (trainer will instantiate model internally)
+        # Pass trainer-specific params from config (e.g., warp_consistency_weight, warmup_steps)
+        trainer_params = OmegaConf.to_container(cfg.trainer.get("params", {}), resolve=True)
         trainer_module = trainer_class(
             model_config=cfg.model,
             learning_rate=cfg.training.lr,
             ema_decay=cfg.training.get("ema_decay", 0.9999),
             image_key="image",
+            **trainer_params,
         )
 
         # Set Plucker weights if applicable (for PluckerVAETrainer)
@@ -177,8 +190,20 @@ def main(cfg: DictConfig):
         print("[INFO] Wandb logging disabled")
 
     # Get device configuration
-    n_gpus, devices, strategy = get_device_config()
-    print(f"[INFO] Using GPUs: {n_gpus}, Strategy: {strategy}")
+    # Check if model parallelism is enabled (romav2_device specified)
+    force_single_gpu = False
+    training_device = 0
+    if hasattr(cfg, 'data') and hasattr(cfg.data, 'params'):
+        dataset_params = cfg.data.params.get('dataset_config', {}).get('params', {})
+        romav2_device = dataset_params.get('romav2_device', None)
+        if romav2_device:
+            # Model parallelism: VAE on one GPU, RoMaV2 on another
+            force_single_gpu = True
+            training_device = cfg.training.get('training_device', 0)
+            print(f"[INFO] Model parallelism: VAE on cuda:{training_device}, RoMaV2 on {romav2_device}")
+
+    n_gpus, devices, strategy = get_device_config(force_single_gpu, training_device)
+    print(f"[INFO] Using devices: {devices}, Strategy: {strategy}")
 
     # Create log directory
     log_dir = f"{cfg.training.output_dir}/{run_name}"
@@ -220,6 +245,7 @@ def main(cfg: DictConfig):
         devices=devices,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         accumulate_grad_batches=cfg.training.get("accumulate_grad_batches", 1),
+        gradient_clip_val=cfg.training.get("gradient_clip_val", None),
         logger=wandb_logger if use_wandb else None,
         log_every_n_steps=cfg.training.get("log_every_n_steps", 50),
         check_val_every_n_epoch=cfg.training.get("check_val_every_n_epoch", 1),
