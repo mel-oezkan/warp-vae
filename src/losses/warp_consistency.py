@@ -167,8 +167,13 @@ class WarpConsistencyLoss(nn.Module):
 
         # Compute mean, accounting for mask
         if mask is not None:
-            num_valid = mask.float().sum() + 1e-8
-            loss = loss.sum() / num_valid
+            num_valid = mask.float().sum()
+            # Avoid NaN when no valid pixels
+            if num_valid > 0:
+                loss = loss.sum() / num_valid
+            else:
+                # Return zero loss if no valid pixels
+                loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
         else:
             loss = loss.mean()
 
