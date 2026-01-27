@@ -358,11 +358,19 @@ class PrecomputedWarpDataset(BaseVAEDataset):
     Use this for faster training when warps have been precomputed
     using the precompute_warps.py script.
 
+    Key advantages over WarpCO3DDataset:
+    - No RoMaV2 model needed during training (~2GB VRAM saved)
+    - Can use num_workers > 0 (parallel data loading)
+    - Faster training iterations
+    - Enables larger batch sizes
+
     Args:
         root_dir: Path to CO3D dataset root directory
         bb_file: Path to gzipped JSON file containing bounding box annotations
         warp_dir: Directory containing precomputed warp files
         image_size: Target image size after transforms (default: 256)
+        warp_resolution: Resolution of precomputed warps (auto-detected if None)
+        confidence_threshold: Minimum confidence for valid correspondences
         **kwargs: Additional arguments passed to BaseVAEDataset
     """
 
@@ -372,6 +380,8 @@ class PrecomputedWarpDataset(BaseVAEDataset):
         bb_file: str,
         warp_dir: str,
         image_size: int = 256,
+        warp_resolution: Optional[int] = None,
+        confidence_threshold: float = 0.1,
         include_plucker: bool = False,
         n_patches: Optional[int] = None,
         transform: Optional[transforms.Compose] = None,
@@ -388,11 +398,22 @@ class PrecomputedWarpDataset(BaseVAEDataset):
 
         self.bb_file = bb_file
         self.warp_dir = Path(warp_dir)
+        self.warp_resolution = warp_resolution
+        self.confidence_threshold = confidence_threshold
 
         # Load samples and pair mappings
         self.samples, self.pairs = self._load_samples_and_pairs(bb_file)
 
-        print(f"[PrecomputedWarpDataset] Loaded {len(self.pairs)} pairs from {bb_file}")
+        # Load metadata if available to get warp resolution
+        metadata_file = self.warp_dir / "metadata.json"
+        if metadata_file.exists() and self.warp_resolution is None:
+            with open(metadata_file, "r") as f:
+                metadata = json.load(f)
+                self.warp_resolution = metadata.get("warp_resolution", image_size)
+                print(f"[PrecomputedWarpDataset] Loaded warp_resolution={self.warp_resolution} from metadata")
+
+        print(f"[PrecomputedWarpDataset] Loaded {len(self.pairs)} pairs from {len(self.samples)} samples")
+        print(f"[PrecomputedWarpDataset] warp_dir={warp_dir}, image_size={image_size}")
 
     def _load_samples_and_pairs(
         self,
@@ -409,9 +430,10 @@ class PrecomputedWarpDataset(BaseVAEDataset):
         for subdir in obj_dict.values():
             samples.extend(subdir)
 
-        # Find precomputed warp files
-        for warp_file in self.warp_dir.glob("warp_*.pt"):
-            # Parse indices from filename: warp_XXXX_YYYY.pt
+        # Find precomputed warp files (supports both 4-digit and 5-digit formats)
+        warp_files = list(self.warp_dir.glob("warp_*.pt"))
+        for warp_file in warp_files:
+            # Parse indices from filename: warp_XXXX_YYYY.pt or warp_XXXXX_YYYYY.pt
             name = warp_file.stem
             parts = name.split("_")
             if len(parts) == 3:
@@ -423,7 +445,23 @@ class PrecomputedWarpDataset(BaseVAEDataset):
                 except ValueError:
                     continue
 
+        if len(pairs) == 0:
+            print(f"[PrecomputedWarpDataset] WARNING: No valid warp pairs found in {self.warp_dir}")
+            print(f"[PrecomputedWarpDataset] Found {len(warp_files)} .pt files but none matched sample indices")
+
         return samples, pairs
+
+    def _resize_warp(self, warp: torch.Tensor, target_size: int) -> torch.Tensor:
+        """Resize warp field while maintaining normalized coordinates."""
+        # warp is (H, W, 2)
+        warp = warp.permute(2, 0, 1).unsqueeze(0)  # (1, 2, H, W)
+        warp = F.interpolate(
+            warp,
+            size=(target_size, target_size),
+            mode="bilinear",
+            align_corners=False
+        )
+        return warp.squeeze(0).permute(1, 2, 0)  # (H, W, 2)
 
     def _load_image(self, idx: int) -> torch.Tensor:
         """Load and transform image at given index."""
@@ -446,17 +484,59 @@ class PrecomputedWarpDataset(BaseVAEDataset):
         img_a = self._load_image(idx_a)
         img_b = self._load_image(idx_b)
 
-        # Load precomputed warp
-        warp_file = self.warp_dir / f"warp_{idx_a:04d}_{idx_b:04d}.pt"
-        warp_data = torch.load(warp_file)
+        # Load precomputed warp (try 5-digit format first, then 4-digit for backwards compat)
+        warp_file = self.warp_dir / f"warp_{idx_a:05d}_{idx_b:05d}.pt"
+        if not warp_file.exists():
+            warp_file = self.warp_dir / f"warp_{idx_a:04d}_{idx_b:04d}.pt"
+        warp_data = torch.load(warp_file, weights_only=True)
+
+        # Extract warp fields
+        warp_ab = warp_data["warp_ab"]
+        confidence_ab = warp_data["confidence_ab"]
+        warp_ba = warp_data["warp_ba"]
+        confidence_ba = warp_data["confidence_ba"]
+
+        # Resize warps to match image size if needed
+        # (precomputed warps may have different resolution)
+        current_warp_size = warp_ab.shape[0]
+        if current_warp_size != self.image_size:
+            # Warn user on first occurrence
+            if not hasattr(self, '_warp_resize_warned'):
+                print(f"[PrecomputedWarpDataset] WARNING: Precomputed warp resolution ({current_warp_size}x{current_warp_size}) "
+                      f"does not match image_size ({self.image_size}x{self.image_size}). "
+                      f"Warps will be scaled automatically. For best results, precompute warps at the target resolution.")
+                self._warp_resize_warned = True
+
+            warp_ab = self._resize_warp(warp_ab, self.image_size)
+            warp_ba = self._resize_warp(warp_ba, self.image_size)
+
+            # Resize confidence maps
+            confidence_ab = F.interpolate(
+                confidence_ab.unsqueeze(0).unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False
+            ).squeeze()
+
+            confidence_ba = F.interpolate(
+                confidence_ba.unsqueeze(0).unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False
+            ).squeeze()
+
+        # Apply confidence threshold
+        if self.confidence_threshold > 0:
+            confidence_ab = torch.clamp(confidence_ab - self.confidence_threshold, min=0) / (1 - self.confidence_threshold)
+            confidence_ba = torch.clamp(confidence_ba - self.confidence_threshold, min=0) / (1 - self.confidence_threshold)
 
         return {
             "image": img_a,
             "image_target": img_b,
-            "warp_ab": warp_data["warp_ab"],
-            "confidence_ab": warp_data["confidence_ab"],
-            "warp_ba": warp_data["warp_ba"],
-            "confidence_ba": warp_data["confidence_ba"],
+            "warp_ab": warp_ab,
+            "confidence_ab": confidence_ab,
+            "warp_ba": warp_ba,
+            "confidence_ba": confidence_ba,
             "index": idx_a,
             "index_target": idx_b,
         }
