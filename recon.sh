@@ -26,6 +26,6 @@
 #     --output_name pastel-chirpy
 
 python compare_latents.py \
-    --checkpoint checkpoints/glossy-classic-limpet-of-mathematics/vae-epochepoch=014.ckpt \
+    --checkpoint checkpoints/feathered-gay-pillbug-of-pizza/vae-epochepoch=049.ckpt \
     --config config/warp_vae_co3d.yaml \
-    --output_name glossy-classic-limpet
+    --output_name feathered-gay-pillbug
