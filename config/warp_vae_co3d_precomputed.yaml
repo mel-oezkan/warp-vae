@@ -1,5 +1,24 @@
-# Warp VAE configuration for CO3D dataset
-# Uses RoMaV2 dense correspondences for multi-view consistency training
+# Warp VAE configuration with PRECOMPUTED warps for faster training
+# Uses precomputed RoMaV2 warps - no RoMaV2 needed during training!
+#
+# SPEEDUP: This config enables:
+#   - num_workers > 0 (parallel data loading)
+#   - No RoMaV2 GPU memory during training (~2GB freed)
+#   - Larger batch sizes possible
+#   - Single GPU training (no DDP overhead)
+#
+# PREREQUISITES:
+#   1. Precompute warps first:
+#      python precompute_warps.py \
+#          --bb_file /data/lab_moezkan/co3d_bboxes/toybus_test.jgz \
+#          --output_dir /data/lab_moezkan/precomputed_warps/toybus \
+#          --root_dir /data/lab_moezkan/co3d_full \
+#          --romav2_setting turbo \
+#          --max_pair_distance 20 \
+#          --num_pairs_per_sample 3
+#
+#   2. Run training:
+#      CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_co3d_precomputed
 
 model:
   base_learning_rate: 4.5e-6
@@ -50,43 +69,38 @@ data:
   target: src.data.datamodule.VAEDataModule
   params:
     dataset_config:
-      type: warp_co3d
+      type: precomputed_warp              # Uses PrecomputedWarpDataset - no RoMaV2!
       params:
         root_dir: "/data/lab_moezkan/co3d_full"
         bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
+        warp_dir: "/data/lab_moezkan/precomputed_warps/toybus"  # Precomputed warp files
         image_size: ${training.image_size}
-        romav2_setting: "turbo"
-        # romav2_device: "cuda:1"           # Model parallelism disabled - RoMaV2 converts PIL internally
-        pair_sampling: "random"
-        max_pair_distance: 20
-        warp_resolution: ${training.image_size}
-        warp_confidence_threshold: 0.75
-        include_plucker: false
+        confidence_threshold: 0.1           # Threshold for valid correspondences
     batch_size: ${training.batch_size}
     val_split: ${training.val_split}
     num_workers: ${training.num_workers}
-    pin_memory: false                       # Disabled since num_workers=0
-    persistent_workers: false               # Must be false when num_workers=0
+    pin_memory: true                        # Can enable now with workers > 0
+    persistent_workers: true                # Keep workers alive between epochs
     shuffle_train: true
 
 training:
-  batch_size: 2                             # Max for GTX 1080 Ti with full SD-VAE architecture
+  batch_size: 4                             # Can increase! No RoMaV2 memory overhead
   image_size: 256
-  num_workers: 0                            # Must be 0 for RoMaV2 (CUDA in dataloader workers)
+  num_workers: 4                            # Can use workers now! No CUDA in dataloader
   val_split: 0.1
   num_epochs: 8
   lr: 4.5e-6
   kl_weight: 0.000001
   lpips_loss_weight: 1.0
   ema_decay: 0.9999
-  precision: 16                             # Mixed precision to reduce memory
-  output_dir: "./outputs/warp_vae_co3d"
+  precision: 16
+  output_dir: "./outputs/warp_vae_co3d_precomputed"
   checkpoint_every_n_epochs: 5
   log_every_n_steps: 50
-  gradient_accumulation_steps: 8            # Accumulate gradients over N batches before updating
+  gradient_accumulation_steps: 4            # Can reduce since batch_size increased
 
 wandb:
   enabled: true
   project: enhanced-VAE
   entity: deep_cv
-  tags: ["warp-vae", "romav2", "co3d", "multi-view-consistency"]
+  tags: ["warp-vae", "precomputed", "co3d", "multi-view-consistency", "fast"]
