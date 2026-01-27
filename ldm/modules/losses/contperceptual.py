@@ -97,8 +97,8 @@ class LPIPSWithDiscriminator(nn.Module):
 
         # Keep logvar computation in FP32 for stability with very small values
         # Clamp logvar to prevent extreme values that cause overflow/underflow
-        logvar_clamped = torch.clamp(self.logvar.float(), min=-10.0, max=10.0)
-        nll_loss = rec_loss.float() / torch.exp(logvar_clamped) + logvar_clamped
+        nll_loss = rec_loss / torch.exp(self.logvar.float()) + self.logvar.float()
+
         weighted_nll_loss = nll_loss
         if weights is not None:
             weighted_nll_loss = weights * nll_loss
