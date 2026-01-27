@@ -17,7 +17,11 @@ from torchvision import transforms
 
 from src.data.base_dataset import BaseVAEDataset
 from data_process.co3d_dataset import jitter_bbox, square_bbox
-from data_process.plucker import compute_directions_from_sample, ray_to_plucker
+from data_process.plucker import (
+    compute_directions_from_sample,
+    ray_to_plucker,
+    plucker_full_image,
+)
 
 
 class CO3DDataset(BaseVAEDataset):
@@ -47,11 +51,29 @@ class CO3DDataset(BaseVAEDataset):
         image_size: int = 256,
         include_plucker: bool = False,
         n_patches: Optional[int] = None,
+        full_resolution_plucker: bool = False,
         crop_images: bool = False,
         apply_augmentation: bool = False,
         transform: Optional[transforms.Compose] = None,
         **kwargs
     ):
+        """
+        Initialize CO3D dataset.
+
+        Args:
+            root_dir: Path to CO3D dataset root directory
+            bb_file: Path to gzipped JSON file containing bounding box annotations
+            image_size: Target image size after transforms (default: 256)
+            include_plucker: Whether to compute Plucker coordinates (default: False)
+            n_patches: Number of patches per dimension for Plucker encoding (default: 8)
+            full_resolution_plucker: If True, compute Plucker for every pixel and return
+                                     shape (6, H, W) for image concatenation. If False,
+                                     return shape (n_patches*n_patches, 6). (default: False)
+            crop_images: Whether to crop images using bounding boxes (default: False)
+            apply_augmentation: Whether to apply jitter augmentation (default: False)
+            transform: Optional custom image transform (default: resize + normalize)
+            **kwargs: Additional arguments passed to BaseVAEDataset
+        """
         # Initialize base class
         super().__init__(
             root_dir=root_dir,
@@ -65,6 +87,7 @@ class CO3DDataset(BaseVAEDataset):
         self.bb_file = bb_file
         self.crop_images = crop_images
         self.apply_augmentation = apply_augmentation
+        self.full_resolution_plucker = full_resolution_plucker
 
         # Augmentation settings
         self.jitter_scale = (1.1, 1.2) if apply_augmentation else (1.0, 1.0)
@@ -75,6 +98,7 @@ class CO3DDataset(BaseVAEDataset):
 
         print(f"[CO3DDataset] Loaded {len(self.samples)} samples from {bb_file}")
         print(f"[CO3DDataset] include_plucker={include_plucker}, "
+              f"full_resolution_plucker={full_resolution_plucker}, "
               f"crop_images={crop_images}, augmentation={apply_augmentation}")
 
     def _load_samples(self, bb_file: str) -> List[Dict[str, Any]]:
@@ -189,8 +213,10 @@ class CO3DDataset(BaseVAEDataset):
             idx: Sample index
 
         Returns:
-            Plucker coordinates tensor of shape (n_patches*n_patches, 6)
-            or None if not available
+            Plucker coordinates tensor:
+            - Shape (6, H, W) if full_resolution_plucker=True (for image concatenation)
+            - Shape (n_patches*n_patches, 6) if full_resolution_plucker=False (patch-based)
+            - None if include_plucker=False
         """
         if not self.include_plucker:
             return None
@@ -200,11 +226,25 @@ class CO3DDataset(BaseVAEDataset):
         # Get camera parameters
         camera_params = self._get_camera_params(idx)
 
-        # Compute ray directions
-        rays = compute_directions_from_sample(camera_params, self.n_patches)
-
-        # Convert to Plucker coordinates
-        plucker_coords = ray_to_plucker(rays)
+        if self.full_resolution_plucker:
+            # Full-resolution Plucker for every pixel (used in PluckerVAE variants)
+            # Returns shape (6, H, W) for easy concatenation with images
+            plucker_coords = plucker_full_image(
+                R=camera_params["R"],
+                T=camera_params["T"],
+                fl=camera_params["focal_length"],
+                pp=camera_params["principal_point"],
+                crop_params=camera_params["crop_params"],
+                original_size=(self._current_orig_h, self._current_orig_w),
+                cropped_size=(self.image_size, self.image_size),
+                device="cpu",  # Will be moved to GPU by dataloader
+                as_image_format=True,  # Return (6, H, W)
+            )
+        else:
+            # Patch-based Plucker (original behavior)
+            # Returns shape (n_patches*n_patches, 6)
+            rays = compute_directions_from_sample(camera_params, self.n_patches)
+            plucker_coords = ray_to_plucker(rays)
 
         return plucker_coords
 
