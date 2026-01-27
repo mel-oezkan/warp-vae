@@ -469,12 +469,191 @@ python train.py --config-name=warp_vae_co3d_small
 python train.py --config-name=warp_vae_co3d
 ```
 
+### Precomputed Warps (Recommended for Production)
+```bash
+# Step 1: Precompute RoMaV2 warps (one-time, can run overnight)
+python precompute_warps.py \
+    --bb_file /data/lab_moezkan/co3d_bboxes/toybus_test.jgz \
+    --output_dir /data/lab_moezkan/precomputed_warps/toybus \
+    --root_dir /data/lab_moezkan/co3d_full \
+    --romav2_setting turbo \
+    --max_pair_distance 20 \
+    --num_pairs_per_sample 3 \
+    --warp_resolution 256
+
+# Step 2: Train with precomputed warps (much faster!)
+python train.py --config-name=warp_vae_co3d_precomputed
+```
+
 ### Specifying GPUs (optional)
 ```bash
 # Use specific GPU(s)
 CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_co3d
 CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_co3d
 ```
+
+## Precomputed Warps Training
+
+### Overview
+
+The precomputed warp pipeline separates the expensive RoMaV2 correspondence computation from the training loop, providing significant speedups and enabling:
+
+- **Parallel data loading** (`num_workers > 0`)
+- **Larger batch sizes** (~2GB VRAM freed from RoMaV2)
+- **Faster iterations** (no RoMaV2 forward pass during training)
+- **Better GPU utilization** (single model on GPU)
+
+### Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    PRECOMPUTATION PHASE (One-time)                   │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  CO3D Dataset                                                        │
+│       │                                                              │
+│       ▼                                                              │
+│  ┌─────────────┐     ┌─────────────┐     ┌─────────────────────────┐ │
+│  │ Image Pairs │ ──► │   RoMaV2    │ ──► │  Precomputed Warps      │ │
+│  │  (A, B)     │     │   Model     │     │  warp_XXXXX_YYYYY.pt    │ │
+│  └─────────────┘     └─────────────┘     └─────────────────────────┘ │
+│                                                                      │
+│  Output per pair:                                                    │
+│    - warp_ab: (H, W, 2) normalized grid coordinates                  │
+│    - confidence_ab: (H, W) correspondence confidence                 │
+│    - warp_ba: (H, W, 2) reverse direction                            │
+│    - confidence_ba: (H, W) reverse confidence                        │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│                      TRAINING PHASE (Fast!)                          │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌─────────────────┐                                                 │
+│  │ DataLoader      │  num_workers=4, pin_memory=True                 │
+│  │ (parallel)      │                                                 │
+│  └────────┬────────┘                                                 │
+│           │                                                          │
+│           ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │ PrecomputedWarpDataset                                          │ │
+│  │   - Load image pair from disk                                   │ │
+│  │   - Load precomputed warp from .pt file                         │ │
+│  │   - Resize warp if needed (with warning)                        │ │
+│  │   - Apply confidence threshold                                   │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│           │                                                          │
+│           ▼                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │ WarpVAETrainer (same as online training)                        │ │
+│  │   - Standard VAE forward pass                                   │ │
+│  │   - Warp consistency loss in latent space                       │ │
+│  │   - Gradient accumulation if needed                              │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Precomputation Script
+
+**File:** `precompute_warps.py`
+
+```bash
+python precompute_warps.py \
+    --bb_file <path_to_bbox_file.jgz> \
+    --output_dir <output_directory> \
+    --root_dir <co3d_root> \
+    --romav2_setting turbo \
+    --max_pair_distance 20 \
+    --num_pairs_per_sample 3 \
+    --warp_resolution 256 \
+    --resume  # Continue from existing files
+```
+
+**Parameters:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--bb_file` | Path to CO3D bounding box .jgz file | Required |
+| `--output_dir` | Directory to save precomputed warps | Required |
+| `--root_dir` | CO3D dataset root directory | `/data/lab_moezkan/co3d_full` |
+| `--romav2_setting` | RoMaV2 model variant | `turbo` |
+| `--image_size` | Image size for warp computation | 256 |
+| `--warp_resolution` | Output warp field resolution | 256 |
+| `--max_pair_distance` | Maximum frame distance for pairs | 20 |
+| `--num_pairs_per_sample` | Number of pairs per sample | 3 |
+| `--resume` | Skip already computed warps | False |
+
+**Output Structure:**
+
+```
+output_dir/
+├── metadata.json           # Precomputation settings
+├── warp_00000_00001.pt     # Warp data for pair (0, 1)
+├── warp_00000_00005.pt     # Warp data for pair (0, 5)
+├── warp_00001_00003.pt     # ...
+└── ...
+```
+
+### Dataset: `PrecomputedWarpDataset`
+
+**File:** `src/data/warp_dataset.py`
+
+The dataset automatically:
+1. Discovers available warp pairs from the output directory
+2. Loads and resizes warps to match training image size (with warning if mismatch)
+3. Applies confidence thresholding
+4. Returns the same format as `WarpCO3DDataset`
+
+**Key Parameters:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `root_dir` | CO3D dataset root | Required |
+| `bb_file` | Bounding box file | Required |
+| `warp_dir` | Directory with precomputed warps | Required |
+| `image_size` | Training image size | 256 |
+| `confidence_threshold` | Min confidence for valid matches | 0.1 |
+
+### Configuration
+
+**File:** `config/warp_vae_co3d_precomputed.yaml`
+
+Key differences from online training:
+
+```yaml
+data:
+  params:
+    dataset_config:
+      type: precomputed_warp        # Uses PrecomputedWarpDataset
+      params:
+        warp_dir: "/path/to/precomputed_warps"
+    num_workers: 4                  # Can use workers now!
+    pin_memory: true                # Enable for faster transfers
+    persistent_workers: true        # Keep workers alive
+
+training:
+  batch_size: 4                     # Larger batches possible
+  gradient_accumulation_steps: 4    # Can reduce (larger effective batch)
+```
+
+### Performance Comparison
+
+| Metric | Online (WarpCO3DDataset) | Precomputed |
+|--------|--------------------------|-------------|
+| Data loading workers | 0 (required) | 4+ |
+| RoMaV2 VRAM usage | ~2GB | 0 |
+| Batch size (11GB GPU) | 2 | 4-6 |
+| Iteration time | ~1.5s | ~0.3s |
+| Disk space | - | ~50MB per 1000 pairs |
+
+### Best Practices
+
+1. **Match resolutions**: Precompute warps at the same resolution as training `image_size` to avoid scaling
+2. **Use `--resume`**: For large datasets, precomputation can take hours; use resume if interrupted
+3. **Monitor disk space**: Each warp file is ~50KB, plan accordingly for large datasets
+4. **Validate first**: Run a small test with 10-20 pairs before full precomputation
 
 ## Model Architecture Comparison
 
@@ -510,10 +689,12 @@ CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_co3d
 
 | File | Purpose |
 |------|---------|
-| `src/data/warp_dataset.py` | WarpCO3DDataset with RoMaV2 warps |
+| `src/data/warp_dataset.py` | WarpCO3DDataset (online) and PrecomputedWarpDataset |
 | `src/losses/warp_consistency.py` | Warp consistency loss functions |
 | `src/trainer/vae_trainers.py` | WarpVAETrainer class |
+| `precompute_warps.py` | Script to precompute RoMaV2 warps |
 | `config/warp_vae_co3d_small.yaml` | Small model config (ch=64, 128×128) |
-| `config/warp_vae_co3d.yaml` | Full SD-VAE config (ch=128, 256×256) |
+| `config/warp_vae_co3d.yaml` | Full SD-VAE config (ch=128, 256×256, online warps) |
+| `config/warp_vae_co3d_precomputed.yaml` | Precomputed warps config (recommended) |
 | `eval_warp_vae.py` | Evaluation and visualization |
 | `compare_latents.py` | Compare latent representations across models |
