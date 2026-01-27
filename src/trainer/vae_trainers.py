@@ -628,10 +628,10 @@ class WarpVAETrainer(BaseVAETrainer):
 
         # Compute warp loss only if not using vanilla mode
         if use_vanilla_only:
-            warp_loss = torch.tensor(0.0, device=inputs.device)
+            warp_loss = torch.tensor(0.0, device=inputs.device, dtype=inputs.dtype, requires_grad=True)
             warp_log_dict = {
-                "train/warp_consistency_loss": torch.tensor(0.0, device=inputs.device),
-                "train/warp_factor": torch.tensor(0.0, device=inputs.device),
+                "train/warp_consistency_loss": torch.tensor(0.0, device=inputs.device, dtype=inputs.dtype),
+                "train/warp_factor": torch.tensor(0.0, device=inputs.device, dtype=inputs.dtype),
             }
         else:
             # Get target encoding
@@ -655,19 +655,20 @@ class WarpVAETrainer(BaseVAETrainer):
             opt_ae.zero_grad()
 
         # Log losses (unscaled for interpretability)
-        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
-        self.log("train/warp_loss", warp_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
-        self.log("train/total_ae_loss", total_ae_loss, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=False)
-        self.log("train/vanilla_mode", float(use_vanilla_only), prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
+        # Note: sync_dist=True ensures logs are synced to logger on every step
+        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/warp_loss", warp_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/total_ae_loss", total_ae_loss, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/vanilla_mode", float(use_vanilla_only), prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
         # Filter out total_loss from log_dict_ae to avoid duplicate logging
         log_dict_ae_filtered = {k: v for k, v in log_dict_ae.items() if "total_loss" not in k}
-        self.log_dict(log_dict_ae_filtered, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
-        self.log_dict(warp_log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
+        self.log_dict(log_dict_ae_filtered, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
+        self.log_dict(warp_log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
 
         # Log memory usage periodically
         if batch_idx % 100 == 0:
             mem_stats = self.memory_profiler.snapshot(f"step_{self.global_step}")
-            self.log("memory/allocated_mb", mem_stats.get('allocated_mb', 0), logger=True, sync_dist=False)
+            self.log("memory/allocated_mb", mem_stats.get('allocated_mb', 0), logger=True, sync_dist=True)
 
         # ========== Optimize Discriminator ==========
         discloss, log_dict_disc = self.model.loss(
@@ -691,8 +692,8 @@ class WarpVAETrainer(BaseVAETrainer):
             opt_disc.step()
             opt_disc.zero_grad()
 
-        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
-        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
+        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
 
         return total_ae_loss
 
