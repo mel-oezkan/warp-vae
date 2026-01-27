@@ -931,3 +931,670 @@ class IdentityFirstStage(torch.nn.Module):
 
     def forward(self, x, *args, **kwargs):
         return x
+
+
+# =============================================================================
+# PluckerVAE Variants
+# =============================================================================
+
+
+class PluckerConditionedVAE(AutoencoderKL):
+    """
+    Variant 3: VAE conditioned on Plucker coordinates.
+
+    Plucker rays are concatenated with the input image (9 channels total).
+    The encoder learns from this combined input but does NOT predict Plucker rays.
+    The decoder reconstructs both the image AND the Plucker rays.
+
+    This variant tests whether conditioning alone improves 3D awareness.
+
+    Input: image (3ch) + plucker (6ch) = 9 channels
+    Output: reconstructed image (3ch) + reconstructed plucker (6ch)
+    """
+
+    def __init__(
+        self,
+        ddconfig,
+        lossconfig,
+        embed_dim,
+        plucker_key: str = "plucker_coords",
+        ckpt_path=None,
+        ignore_keys=[],
+        image_key="image",
+        colorize_nlabels=None,
+        monitor=None,
+        ema_decay=None,
+        learn_logvar=False,
+        plucker_recon_weight: float = 0.5,
+        plucker_constraint_weight: float = 0.1,
+    ):
+        """
+        Initialize PluckerConditionedVAE.
+
+        Args:
+            ddconfig: Encoder/decoder config. Should have in_channels=9.
+            lossconfig: Loss function configuration
+            embed_dim: Embedding dimension for VAE latent
+            plucker_key: Key for Plucker coordinates in batch dict
+            plucker_recon_weight: Weight for Plucker reconstruction loss
+            plucker_constraint_weight: Weight for Plucker constraints
+        """
+        # Validate input channels
+        if ddconfig.get("in_channels", 3) != 9:
+            print(f"Warning: PluckerConditionedVAE expects in_channels=9, "
+                  f"got {ddconfig.get('in_channels', 3)}")
+
+        super().__init__(
+            ddconfig=ddconfig,
+            lossconfig=lossconfig,
+            embed_dim=embed_dim,
+            ckpt_path=None,  # Load later
+            ignore_keys=ignore_keys,
+            image_key=image_key,
+            colorize_nlabels=colorize_nlabels,
+            monitor=monitor,
+            ema_decay=ema_decay,
+            learn_logvar=learn_logvar,
+        )
+
+        self.plucker_key = plucker_key
+        self.plucker_recon_weight = plucker_recon_weight
+        self.plucker_constraint_weight = plucker_constraint_weight
+
+        # Get decoder output channel count (before final conv)
+        # The decoder's final block_in = ch * ch_mult[0] = ch
+        decoder_ch = ddconfig["ch"]
+
+        # Multi-head output: image (3ch) + plucker (6ch)
+        # Replace the default decoder conv_out with separate heads
+        self.decoder_img_head = torch.nn.Conv2d(
+            decoder_ch, 3, kernel_size=3, stride=1, padding=1
+        )
+        self.decoder_plucker_head = torch.nn.Conv2d(
+            decoder_ch, 6, kernel_size=3, stride=1, padding=1
+        )
+
+        # Store original conv_out for reference, but don't use it
+        self._original_conv_out = self.decoder.conv_out
+
+        # Load checkpoint if provided
+        if ckpt_path is not None:
+            self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+    def decode(self, z):
+        """
+        Decode latent to image and Plucker coordinates.
+
+        Args:
+            z: Latent representation (B, embed_dim, H', W')
+
+        Returns:
+            Tuple of (reconstructed_image, reconstructed_plucker)
+        """
+        z = self.post_quant_conv(z)
+
+        # Run decoder with give_pre_end to get features before conv_out
+        # We need to manually do the final steps
+        h = self.decoder.conv_in(z)
+
+        # Middle
+        h = self.decoder.mid.block_1(h, None)
+        h = self.decoder.mid.attn_1(h)
+        h = self.decoder.mid.block_2(h, None)
+
+        # Upsampling
+        for i_level in reversed(range(self.decoder.num_resolutions)):
+            for i_block in range(self.decoder.num_res_blocks + 1):
+                h = self.decoder.up[i_level].block[i_block](h, None)
+                if len(self.decoder.up[i_level].attn) > 0:
+                    h = self.decoder.up[i_level].attn[i_block](h)
+            if i_level != 0:
+                h = self.decoder.up[i_level].upsample(h)
+
+        # Final normalization and activation
+        h = self.decoder.norm_out(h)
+        h = h * torch.sigmoid(h)  # swish/SiLU
+
+        # Multi-head outputs
+        recon_img = self.decoder_img_head(h)
+        recon_plucker = self.decoder_plucker_head(h)
+
+        return recon_img, recon_plucker
+
+    def forward(self, image, plucker, sample_posterior=True):
+        """
+        Forward pass through PluckerConditionedVAE.
+
+        Args:
+            image: Input image tensor (B, 3, H, W)
+            plucker: Input Plucker coordinates (B, 6, H, W)
+            sample_posterior: Whether to sample from posterior or use mode
+
+        Returns:
+            Tuple of (recon_img, recon_plucker, posterior)
+        """
+        # Concatenate image and plucker for encoder input
+        x = torch.cat([image, plucker], dim=1)  # (B, 9, H, W)
+
+        # Encode
+        posterior = self.encode(x)
+
+        # Sample or use mode
+        if sample_posterior:
+            z = posterior.sample()
+        else:
+            z = posterior.mode()
+
+        # Decode to both outputs
+        recon_img, recon_plucker = self.decode(z)
+
+        return recon_img, recon_plucker, posterior
+
+    def plucker_constraint_loss(self, plucker):
+        """
+        Compute Plucker geometric constraints.
+
+        Args:
+            plucker: Plucker coordinates (B, 6, H, W)
+
+        Returns:
+            Constraint loss (orthogonality + normalization)
+        """
+        d = plucker[:, :3]  # Direction (B, 3, H, W)
+        m = plucker[:, 3:]  # Moment (B, 3, H, W)
+
+        # Orthogonality: d . m = 0
+        dot_product = (d * m).sum(dim=1)  # (B, H, W)
+        ortho_loss = torch.mean(dot_product ** 2)
+
+        # Unit direction: ||d|| = 1
+        d_norm = torch.norm(d, dim=1)  # (B, H, W)
+        norm_loss = F.mse_loss(d_norm, torch.ones_like(d_norm))
+
+        return ortho_loss + norm_loss
+
+    def get_last_layer(self):
+        """Return image head weights for discriminator gradient scaling."""
+        return self.decoder_img_head.weight
+
+    def configure_optimizers(self):
+        """Setup optimizers including multi-head decoder parameters."""
+        lr = self.learning_rate
+        ae_params_list = (
+            list(self.encoder.parameters())
+            + list(self.decoder.parameters())
+            + list(self.quant_conv.parameters())
+            + list(self.post_quant_conv.parameters())
+            + list(self.decoder_img_head.parameters())
+            + list(self.decoder_plucker_head.parameters())
+        )
+        if self.learn_logvar:
+            ae_params_list.append(self.loss.logvar)
+        opt_ae = torch.optim.Adam(ae_params_list, lr=lr, betas=(0.5, 0.9))
+        opt_disc = torch.optim.Adam(
+            self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)
+        )
+        return [opt_ae, opt_disc], []
+
+
+class DirectPluckerVAE(AutoencoderKL):
+    """
+    Variant 2: VAE with unified latent space predicting image + Plucker.
+
+    Similar to PluckerConditionedVAE but conceptually treats Plucker
+    as a direct prediction target alongside the image.
+
+    Input: image (3ch) + plucker (6ch) = 9 channels
+    Output: reconstructed image (3ch) + reconstructed plucker (6ch)
+
+    Key difference from Variant 3: The loss formulation emphasizes
+    the Plucker prediction as an auxiliary task rather than just conditioning.
+    """
+
+    def __init__(
+        self,
+        ddconfig,
+        lossconfig,
+        embed_dim,
+        plucker_key: str = "plucker_coords",
+        ckpt_path=None,
+        ignore_keys=[],
+        image_key="image",
+        colorize_nlabels=None,
+        monitor=None,
+        ema_decay=None,
+        learn_logvar=False,
+        plucker_recon_weight: float = 0.5,
+        plucker_constraint_weight: float = 0.1,
+    ):
+        """
+        Initialize DirectPluckerVAE.
+
+        Args:
+            ddconfig: Encoder/decoder config. Should have in_channels=9.
+            lossconfig: Loss function configuration
+            embed_dim: Embedding dimension for VAE latent
+            plucker_key: Key for Plucker coordinates in batch dict
+            plucker_recon_weight: Weight for Plucker reconstruction loss
+            plucker_constraint_weight: Weight for Plucker constraints
+        """
+        if ddconfig.get("in_channels", 3) != 9:
+            print(f"Warning: DirectPluckerVAE expects in_channels=9, "
+                  f"got {ddconfig.get('in_channels', 3)}")
+
+        super().__init__(
+            ddconfig=ddconfig,
+            lossconfig=lossconfig,
+            embed_dim=embed_dim,
+            ckpt_path=None,
+            ignore_keys=ignore_keys,
+            image_key=image_key,
+            colorize_nlabels=colorize_nlabels,
+            monitor=monitor,
+            ema_decay=ema_decay,
+            learn_logvar=learn_logvar,
+        )
+
+        self.plucker_key = plucker_key
+        self.plucker_recon_weight = plucker_recon_weight
+        self.plucker_constraint_weight = plucker_constraint_weight
+
+        decoder_ch = ddconfig["ch"]
+
+        # Multi-head output
+        self.decoder_img_head = torch.nn.Conv2d(
+            decoder_ch, 3, kernel_size=3, stride=1, padding=1
+        )
+        self.decoder_plucker_head = torch.nn.Conv2d(
+            decoder_ch, 6, kernel_size=3, stride=1, padding=1
+        )
+
+        if ckpt_path is not None:
+            self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+    def decode(self, z):
+        """Decode latent to image and Plucker coordinates."""
+        z = self.post_quant_conv(z)
+
+        h = self.decoder.conv_in(z)
+        h = self.decoder.mid.block_1(h, None)
+        h = self.decoder.mid.attn_1(h)
+        h = self.decoder.mid.block_2(h, None)
+
+        for i_level in reversed(range(self.decoder.num_resolutions)):
+            for i_block in range(self.decoder.num_res_blocks + 1):
+                h = self.decoder.up[i_level].block[i_block](h, None)
+                if len(self.decoder.up[i_level].attn) > 0:
+                    h = self.decoder.up[i_level].attn[i_block](h)
+            if i_level != 0:
+                h = self.decoder.up[i_level].upsample(h)
+
+        h = self.decoder.norm_out(h)
+        h = h * torch.sigmoid(h)
+
+        recon_img = self.decoder_img_head(h)
+        recon_plucker = self.decoder_plucker_head(h)
+
+        return recon_img, recon_plucker
+
+    def forward(self, image, plucker, sample_posterior=True):
+        """Forward pass through DirectPluckerVAE."""
+        x = torch.cat([image, plucker], dim=1)
+        posterior = self.encode(x)
+
+        if sample_posterior:
+            z = posterior.sample()
+        else:
+            z = posterior.mode()
+
+        recon_img, recon_plucker = self.decode(z)
+        return recon_img, recon_plucker, posterior
+
+    def plucker_constraint_loss(self, plucker):
+        """Compute Plucker geometric constraints."""
+        d = plucker[:, :3]
+        m = plucker[:, 3:]
+
+        dot_product = (d * m).sum(dim=1)
+        ortho_loss = torch.mean(dot_product ** 2)
+
+        d_norm = torch.norm(d, dim=1)
+        norm_loss = F.mse_loss(d_norm, torch.ones_like(d_norm))
+
+        return ortho_loss + norm_loss
+
+    def get_last_layer(self):
+        return self.decoder_img_head.weight
+
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        ae_params_list = (
+            list(self.encoder.parameters())
+            + list(self.decoder.parameters())
+            + list(self.quant_conv.parameters())
+            + list(self.post_quant_conv.parameters())
+            + list(self.decoder_img_head.parameters())
+            + list(self.decoder_plucker_head.parameters())
+        )
+        if self.learn_logvar:
+            ae_params_list.append(self.loss.logvar)
+        opt_ae = torch.optim.Adam(ae_params_list, lr=lr, betas=(0.5, 0.9))
+        opt_disc = torch.optim.Adam(
+            self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)
+        )
+        return [opt_ae, opt_disc], []
+
+
+class ConcatPluckerVAE(AutoencoderKL):
+    """
+    Variant 1: VAE with separate latent nodes for image and Plucker components.
+
+    This variant uses three separate latent distributions:
+    1. Image latent (z_img)
+    2. Plucker direction latent (z_d)
+    3. Plucker moment latent (z_m)
+
+    Additionally includes an encoder-side Plucker prediction head.
+
+    Input: image (3ch) + plucker (6ch) = 9 channels
+    Output: reconstructed image (3ch) + reconstructed direction (3ch) + reconstructed moment (3ch)
+    Plus: encoder Plucker prediction
+    """
+
+    def __init__(
+        self,
+        ddconfig,
+        lossconfig,
+        embed_dim,
+        plucker_key: str = "plucker_coords",
+        ckpt_path=None,
+        ignore_keys=[],
+        image_key="image",
+        colorize_nlabels=None,
+        monitor=None,
+        ema_decay=None,
+        learn_logvar=False,
+        # Loss weights
+        img_recon_weight: float = 1.0,
+        d_recon_weight: float = 0.5,
+        m_recon_weight: float = 0.5,
+        encoder_plucker_weight: float = 0.3,
+        plucker_constraint_weight: float = 0.1,
+        # Latent dimensions
+        latent_dim_img: int = 4,
+        latent_dim_d: int = 3,
+        latent_dim_m: int = 3,
+        # Encoder Plucker head config
+        plucker_hidden_dim: int = 512,
+        plucker_dropout: float = 0.1,
+        n_patches: int = 8,
+    ):
+        """
+        Initialize ConcatPluckerVAE.
+
+        Args:
+            ddconfig: Encoder/decoder config. Should have in_channels=9.
+            lossconfig: Loss function configuration
+            embed_dim: Embedding dimension for image VAE latent
+            plucker_key: Key for Plucker coordinates in batch dict
+            latent_dim_img: Channels for image latent (default: 4)
+            latent_dim_d: Channels for direction latent (default: 3)
+            latent_dim_m: Channels for moment latent (default: 3)
+            n_patches: Number of patches for encoder Plucker prediction
+        """
+        if ddconfig.get("in_channels", 3) != 9:
+            print(f"Warning: ConcatPluckerVAE expects in_channels=9, "
+                  f"got {ddconfig.get('in_channels', 3)}")
+
+        # Initialize base class (creates encoder, decoder, single quant_conv)
+        super().__init__(
+            ddconfig=ddconfig,
+            lossconfig=lossconfig,
+            embed_dim=embed_dim,
+            ckpt_path=None,
+            ignore_keys=ignore_keys,
+            image_key=image_key,
+            colorize_nlabels=colorize_nlabels,
+            monitor=monitor,
+            ema_decay=ema_decay,
+            learn_logvar=learn_logvar,
+        )
+
+        self.plucker_key = plucker_key
+        self.img_recon_weight = img_recon_weight
+        self.d_recon_weight = d_recon_weight
+        self.m_recon_weight = m_recon_weight
+        self.encoder_plucker_weight = encoder_plucker_weight
+        self.plucker_constraint_weight = plucker_constraint_weight
+
+        self.latent_dim_img = latent_dim_img
+        self.latent_dim_d = latent_dim_d
+        self.latent_dim_m = latent_dim_m
+        self.n_patches = n_patches
+
+        # Encoder output channels
+        encoder_out_channels = 2 * ddconfig["z_channels"]
+
+        # Three separate quantization convolutions
+        # Replace the single quant_conv with three
+        self.quant_conv_img = torch.nn.Conv2d(
+            encoder_out_channels, 2 * latent_dim_img, 1
+        )  # 2x for mean + logvar
+        self.quant_conv_d = torch.nn.Conv2d(
+            encoder_out_channels, 2 * latent_dim_d, 1
+        )
+        self.quant_conv_m = torch.nn.Conv2d(
+            encoder_out_channels, 2 * latent_dim_m, 1
+        )
+
+        # Combined latent: img + d + m
+        total_latent_dim = latent_dim_img + latent_dim_d + latent_dim_m
+
+        # Post-quantization conv takes combined latent
+        self.post_quant_conv = torch.nn.Conv2d(
+            total_latent_dim, ddconfig["z_channels"], 1
+        )
+
+        # Decoder multi-head output
+        decoder_ch = ddconfig["ch"]
+        self.decoder_img_head = torch.nn.Conv2d(
+            decoder_ch, 3, kernel_size=3, stride=1, padding=1
+        )
+        self.decoder_d_head = torch.nn.Conv2d(
+            decoder_ch, 3, kernel_size=3, stride=1, padding=1
+        )
+        self.decoder_m_head = torch.nn.Conv2d(
+            decoder_ch, 3, kernel_size=3, stride=1, padding=1
+        )
+
+        # Encoder Plucker prediction head (similar to PluckerAutoencoder)
+        self.pluck_head = torch.nn.Conv2d(encoder_out_channels, 6, kernel_size=1)
+        self.pluck_act = torch.nn.SiLU()
+
+        # Plucker MLP for refinement
+        self.pluck_norm_in = torch.nn.LayerNorm(6)
+        self.pluck_proj_layers = torch.nn.ModuleList([
+            self._make_projection_layer(6, plucker_hidden_dim, plucker_dropout),
+            self._make_projection_layer(
+                plucker_hidden_dim, plucker_hidden_dim, plucker_dropout
+            ),
+        ])
+        self.pluck_proj_out = torch.nn.Linear(plucker_hidden_dim, 6)
+
+        # Initialize with small weights
+        for module in self.pluck_proj_layers.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight, gain=0.01)
+        torch.nn.init.xavier_uniform_(self.pluck_proj_out.weight, gain=0.01)
+
+        if ckpt_path is not None:
+            self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+    def _make_projection_layer(self, in_dim, out_dim, dropout_rate):
+        """Create a projection layer with normalization and dropout."""
+        return torch.nn.Sequential(
+            torch.nn.Linear(in_dim, out_dim),
+            torch.nn.LayerNorm(out_dim),
+            torch.nn.SiLU(),
+            torch.nn.Dropout(dropout_rate),
+        )
+
+    def encode(self, x):
+        """
+        Encode input to three separate latent distributions + encoder Plucker prediction.
+
+        Args:
+            x: Concatenated input (B, 9, H, W)
+
+        Returns:
+            Tuple of (posterior_img, posterior_d, posterior_m, pluck_pred)
+        """
+        B = x.shape[0]
+        h = self.encoder(x)
+
+        # Three separate latent distributions
+        moments_img = self.quant_conv_img(h)
+        moments_d = self.quant_conv_d(h)
+        moments_m = self.quant_conv_m(h)
+
+        posterior_img = DiagonalGaussianDistribution(moments_img)
+        posterior_d = DiagonalGaussianDistribution(moments_d)
+        posterior_m = DiagonalGaussianDistribution(moments_m)
+
+        # Encoder Plucker prediction (auxiliary task)
+        pluck = self.pluck_head(h)
+        pluck = self.pluck_act(pluck)
+
+        # Interpolate to n_patches
+        pluck = F.interpolate(
+            pluck,
+            size=(self.n_patches, self.n_patches),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        # MLP processing
+        pluck = pluck.permute(0, 2, 3, 1).reshape(B, -1, 6).contiguous()
+        pluck = self.pluck_norm_in(pluck)
+
+        for layer in self.pluck_proj_layers:
+            pluck = layer(pluck)
+
+        pluck_pred = self.pluck_proj_out(pluck)
+
+        return posterior_img, posterior_d, posterior_m, pluck_pred
+
+    def decode(self, z_img, z_d, z_m):
+        """
+        Decode combined latent to image and Plucker components.
+
+        Args:
+            z_img: Image latent (B, latent_dim_img, H', W')
+            z_d: Direction latent (B, latent_dim_d, H', W')
+            z_m: Moment latent (B, latent_dim_m, H', W')
+
+        Returns:
+            Tuple of (recon_img, recon_d, recon_m)
+        """
+        # Concatenate latents
+        z_combined = torch.cat([z_img, z_d, z_m], dim=1)
+        z = self.post_quant_conv(z_combined)
+
+        # Decode
+        h = self.decoder.conv_in(z)
+        h = self.decoder.mid.block_1(h, None)
+        h = self.decoder.mid.attn_1(h)
+        h = self.decoder.mid.block_2(h, None)
+
+        for i_level in reversed(range(self.decoder.num_resolutions)):
+            for i_block in range(self.decoder.num_res_blocks + 1):
+                h = self.decoder.up[i_level].block[i_block](h, None)
+                if len(self.decoder.up[i_level].attn) > 0:
+                    h = self.decoder.up[i_level].attn[i_block](h)
+            if i_level != 0:
+                h = self.decoder.up[i_level].upsample(h)
+
+        h = self.decoder.norm_out(h)
+        h = h * torch.sigmoid(h)
+
+        # Three separate output heads
+        recon_img = self.decoder_img_head(h)
+        recon_d = self.decoder_d_head(h)
+        recon_m = self.decoder_m_head(h)
+
+        return recon_img, recon_d, recon_m
+
+    def forward(self, image, plucker, sample_posterior=True):
+        """
+        Forward pass through ConcatPluckerVAE.
+
+        Args:
+            image: Input image (B, 3, H, W)
+            plucker: Input Plucker (B, 6, H, W)
+            sample_posterior: Whether to sample from posteriors
+
+        Returns:
+            Tuple of (recon_img, recon_d, recon_m, posteriors, pluck_pred)
+            where posteriors = (posterior_img, posterior_d, posterior_m)
+        """
+        x = torch.cat([image, plucker], dim=1)
+
+        posterior_img, posterior_d, posterior_m, pluck_pred = self.encode(x)
+
+        if sample_posterior:
+            z_img = posterior_img.sample()
+            z_d = posterior_d.sample()
+            z_m = posterior_m.sample()
+        else:
+            z_img = posterior_img.mode()
+            z_d = posterior_d.mode()
+            z_m = posterior_m.mode()
+
+        recon_img, recon_d, recon_m = self.decode(z_img, z_d, z_m)
+
+        posteriors = (posterior_img, posterior_d, posterior_m)
+        return recon_img, recon_d, recon_m, posteriors, pluck_pred
+
+    def plucker_constraint_loss(self, d, m):
+        """
+        Compute Plucker geometric constraints on separate d and m.
+
+        Args:
+            d: Direction (B, 3, H, W)
+            m: Moment (B, 3, H, W)
+        """
+        dot_product = (d * m).sum(dim=1)
+        ortho_loss = torch.mean(dot_product ** 2)
+
+        d_norm = torch.norm(d, dim=1)
+        norm_loss = F.mse_loss(d_norm, torch.ones_like(d_norm))
+
+        return ortho_loss + norm_loss
+
+    def get_last_layer(self):
+        return self.decoder_img_head.weight
+
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        ae_params_list = (
+            list(self.encoder.parameters())
+            + list(self.decoder.parameters())
+            + list(self.quant_conv_img.parameters())
+            + list(self.quant_conv_d.parameters())
+            + list(self.quant_conv_m.parameters())
+            + list(self.post_quant_conv.parameters())
+            + list(self.decoder_img_head.parameters())
+            + list(self.decoder_d_head.parameters())
+            + list(self.decoder_m_head.parameters())
+            + list(self.pluck_head.parameters())
+            + list(self.pluck_norm_in.parameters())
+            + list(self.pluck_proj_layers.parameters())
+            + list(self.pluck_proj_out.parameters())
+        )
+        if self.learn_logvar:
+            ae_params_list.append(self.loss.logvar)
+        opt_ae = torch.optim.Adam(ae_params_list, lr=lr, betas=(0.5, 0.9))
+        opt_disc = torch.optim.Adam(
+            self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9)
+        )
+        return [opt_ae, opt_disc], []
