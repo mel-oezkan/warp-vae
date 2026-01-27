@@ -388,3 +388,95 @@ def compute_directions_from_sample(sample, patch_size: int) -> torch.Tensor:
     directions = unprojected - origins
 
     return torch.cat((origins, directions), dim=-1)
+
+
+def plucker_full_image(
+    R, T, fl, pp, crop_params, original_size, cropped_size, device, as_image_format=True
+):
+    """Compute Plücker coordinates for every pixel in the image.
+
+    This function computes full-resolution Plücker rays, useful for concatenating
+    with image tensors in PluckerVAE variants.
+
+    Args:
+        R: Rotation matrix (3, 3)
+        T: Translation vector (3,)
+        fl: Focal length (fx, fy)
+        pp: Principal point (cx, cy)
+        crop_params: Crop parameters from CO3D
+        original_size: Original image size (H, W)
+        cropped_size: Final cropped/resized image size (H, W)
+        device: PyTorch device
+        as_image_format: If True, returns (6, H, W) for concatenation with images.
+                         If False, returns (H*W, 6) flat format.
+
+    Returns:
+        Plücker coordinates tensor:
+            - (6, H, W) if as_image_format=True
+            - (H*W, 6) if as_image_format=False
+    """
+    fl, pp = update_intrinsics_after_crop(
+        focal_length=fl,
+        principle_point=pp,
+        crop_params=crop_params,
+        original_image_size=original_size,
+        cropped_image_size=cropped_size,
+    )
+    H, W = cropped_size
+
+    pixel_grid = create_grid(H, W, device=device, patch_num=None)
+    plucker = plucker_from_all_pixels(R=R, T=T, pixel_grid=pixel_grid, fl=fl, pp=pp)
+
+    if as_image_format:
+        # Reshape from (H*W, 6) to (6, H, W) for image-like format
+        plucker = plucker.view(H, W, 6).permute(2, 0, 1)  # (6, H, W)
+
+    return plucker
+
+
+def plucker_full_image_from_sample(sample, image_size, device, as_image_format=True):
+    """Convenience function to compute full-resolution Plücker from a data sample.
+
+    Args:
+        sample: Dictionary containing camera parameters:
+            - R: Rotation matrix (3, 3)
+            - T: Translation vector (3,)
+            - focal_length: (2,) tensor
+            - principal_point: (2,) tensor
+            - crop_params: (4,) tensor
+            - original_size: (H, W) or stored in sample
+        image_size: Target image size (H, W) as int or tuple
+        device: PyTorch device
+        as_image_format: If True, returns (6, H, W) format
+
+    Returns:
+        Plücker coordinates tensor
+    """
+    if isinstance(image_size, int):
+        image_size = (image_size, image_size)
+
+    # Get camera parameters from sample
+    R = sample["R"]
+    T = sample["T"]
+    fl = sample["focal_length"]
+    pp = sample["principal_point"]
+    crop_params = sample["crop_params"]
+
+    # Get original size - try to get from sample or use a default
+    if "original_size" in sample:
+        original_size = sample["original_size"]
+    else:
+        # Assume square original - this may need adjustment based on dataset
+        original_size = (800, 800)  # CO3D default
+
+    return plucker_full_image(
+        R=R,
+        T=T,
+        fl=fl,
+        pp=pp,
+        crop_params=crop_params,
+        original_size=original_size,
+        cropped_size=image_size,
+        device=device,
+        as_image_format=as_image_format,
+    )
