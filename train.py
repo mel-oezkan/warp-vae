@@ -238,13 +238,14 @@ def main(cfg: DictConfig):
     )
 
     # Create PyTorch Lightning Trainer
+    # Note: accumulate_grad_batches is NOT used here because we use manual optimization
+    # Gradient accumulation is handled manually in training_step
     pl_trainer = Trainer(
         max_epochs=cfg.training.num_epochs,
         precision=cfg.training.precision,
         strategy=strategy,
         devices=devices,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        accumulate_grad_batches=cfg.training.get("accumulate_grad_batches", 1),
         gradient_clip_val=cfg.training.get("gradient_clip_val", None),
         logger=wandb_logger if use_wandb else None,
         log_every_n_steps=cfg.training.get("log_every_n_steps", 50),
