@@ -357,3 +357,73 @@ Full-resolution Plücker at 256×256:
 - Encoder/Decoder: `ldm/modules/diffusionmodules/model.py`
 - Base trainer: `src/trainer/base_trainer.py`
 - VAE trainers: `src/trainer/vae_trainers.py`
+
+## Bug Fixes (2026-01-28)
+
+The following bugs were identified and fixed during testing:
+
+### 1. Output Order Bug in Trainers
+
+**Files**: `src/trainer/vae_trainers.py` (lines 869-882, 967-976)
+
+**Issue**: `PluckerConditionedVAETrainer._get_model_output()` and `DirectPluckerVAETrainer._get_model_output()` returned `(recon_img, recon_plucker, posterior)` but the base trainer's `_validation_step` expected `(reconstruction, posterior, ...)` at positions 0 and 1.
+
+**Error**: `AttributeError: 'Tensor' object has no attribute 'kl'` - because `recon_plucker` was being passed as `posterior`.
+
+**Fix**: Changed return order to `(recon_img, posterior, recon_plucker)` and updated `_compute_additional_losses()` to match.
+
+### 2. get_last_layer Bug
+
+**File**: `src/trainer/base_trainer.py` (lines 421-426)
+
+**Issue**: Base trainer's `get_last_layer()` always returned `self.model.decoder.conv_out.weight`, but PluckerVAE variants use custom decoder heads (`decoder_img_head`). This caused gradient computation errors during adaptive weight calculation.
+
+**Error**: `RuntimeError: One of the differentiated Tensors appears to not have been used in the graph`
+
+**Fix**: Modified `get_last_layer()` to check if model has its own `get_last_layer()` method and use it if available:
+```python
+def get_last_layer(self) -> torch.Tensor:
+    if hasattr(self.model, 'get_last_layer'):
+        return self.model.get_last_layer()
+    return self.model.decoder.conv_out.weight
+```
+
+### 3. NaN Losses with fp16 Precision
+
+**Issue**: Training with `precision=16` (mixed precision) produces NaN losses immediately.
+
+**Fix**: Use `training.precision=32` (float32) instead. The fp16 numerical instability may be due to the Plucker constraint loss computations.
+
+---
+
+## Running the Models
+
+**Important**: Use `training.precision=32` to avoid NaN losses.
+
+```bash
+# Variant 3: PluckerConditionedVAE
+CUDA_VISIBLE_DEVICES=1 python train.py --config-name=plucker_conditioned_vae_co3d
+
+# Variant 2: DirectPluckerVAE
+CUDA_VISIBLE_DEVICES=1 python train.py --config-name=direct_plucker_vae_co3d
+
+# Variant 1: ConcatPluckerVAE
+CUDA_VISIBLE_DEVICES=1 python train.py --config-name=concat_plucker_vae_co3d
+```
+
+### Memory-Constrained Setup (GTX 1080 Ti, 11GB)
+
+```bash
+# Use batch_size=1 for 11GB GPUs
+CUDA_VISIBLE_DEVICES=1 python train.py --config-name=plucker_conditioned_vae_co3d \
+    training.batch_size=1 \
+    wandb.enabled=false
+```
+
+---
+
+## Known Issues / TODO
+
+1. **ConcatPluckerVAE (Variant 1)**: Has custom `training_step` but relies on base class `_validation_step`, which may need a custom implementation for full compatibility with its 5-element output tuple.
+
+2. **fp16 Support**: Investigate numerical stability issues with mixed precision training.
