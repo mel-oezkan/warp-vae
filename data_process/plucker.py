@@ -141,7 +141,7 @@ def plucker_from_all_pixels(R, T, pixel_grid, fl, pp):
     z = torch.ones_like(x)
 
     dir_cam = torch.stack([x, y, z], dim=-1)  # (N,3)
-    # dir_cam= torch.nn.functional.normalize(dir_cam,dim=-1)
+    dir_cam = torch.nn.functional.normalize(dir_cam, dim=-1)  # Normalize to unit vectors
 
     dir_world = dir_cam @ R  # (N,3)
     C_world = -T @ R.T  # (3)
@@ -174,7 +174,7 @@ def plucker_from_single_pixels(R, T, fl, pp, u: float, v: float):
     z = 1.0
 
     dir_cam = torch.tensor([x, y, z])
-    # dir_cam= dir_cam / torch.norm(dir_cam)
+    dir_cam = dir_cam / torch.norm(dir_cam)  # Normalize to unit vector
 
     dir_world = dir_cam @ R  # (3,)
     C_world = -T @ R.T  # (3,) -> Camera center
