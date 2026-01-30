@@ -49,6 +49,9 @@ trainer:
 
 data:
   target: src.data.datamodule.VAEDataModule
+  co3d_dir: "/data/lab_moezkan/co3d_full"
+  bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
+
   params:
     dataset_config:
       type: co3d
@@ -67,21 +70,18 @@ data:
     persistent_workers: true
     shuffle_train: true
 
-# Data paths
-co3d_dir: "/data/lab_moezkan/co3d_full"
-bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
 
 training:
   batch_size: 2  # Reduced due to 9-channel input
   image_size: 256
-  num_epochs: 100
+  num_epochs: 15
   lr: 4.5e-6
   kl_weight: 0.000001
   lpips_loss_weight: 1.0
   disc_lr: 4.5e-6
   ema_decay: 0.9999
-  val_split: 0.1
-  precision: 16
+  val_split: 0.2
+  precision: 32
   output_dir: "./outputs/plucker_conditioned_vae_co3d"
   note: "PluckerConditionedVAE (Variant 3) - Plucker as conditioning"
 
