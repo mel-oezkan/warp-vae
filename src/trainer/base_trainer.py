@@ -420,6 +420,9 @@ class BaseVAETrainer(pl.LightningModule):
     
     def get_last_layer(self) -> torch.Tensor:
         """Get the last layer weights for adaptive loss weighting."""
+        # Prefer model's get_last_layer if available (for custom decoder heads)
+        if hasattr(self.model, 'get_last_layer'):
+            return self.model.get_last_layer()
         return self.model.decoder.conv_out.weight
     
     @torch.no_grad()
