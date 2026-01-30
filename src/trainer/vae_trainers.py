@@ -555,7 +555,7 @@ class WarpVAETrainer(BaseVAETrainer):
                 conf_ab, conf_ba
             )
 
-            consistency_loss = consistency_result["loss"]
+            consistency_loss = consistency_result["loss"] # if bidirectional = mean otherwise A->B loss
             weighted_consistency = self.warp_consistency_weight * warp_factor * consistency_loss
             total_loss = total_loss + weighted_consistency
 
@@ -871,7 +871,8 @@ class PluckerConditionedVAETrainer(BaseVAETrainer):
         Get model output including Plucker reconstruction.
 
         Returns:
-            Tuple of (recon_img, recon_plucker, posterior)
+            Tuple of (recon_img, posterior, recon_plucker)
+            Note: Order is (reconstruction, posterior, ...) for base trainer compatibility
         """
         inputs = self.get_input(batch, self.image_key)
         gt_plucker = batch[self.plucker_key].to(inputs.device)
@@ -879,7 +880,7 @@ class PluckerConditionedVAETrainer(BaseVAETrainer):
         recon_img, recon_plucker, posterior = self.model(
             inputs, gt_plucker, sample_posterior=True
         )
-        return recon_img, recon_plucker, posterior
+        return recon_img, posterior, recon_plucker
 
     def _compute_additional_losses(
         self,
@@ -890,7 +891,7 @@ class PluckerConditionedVAETrainer(BaseVAETrainer):
         """
         Compute Plucker reconstruction and constraint losses.
         """
-        recon_img, recon_plucker, posterior = model_output
+        recon_img, posterior, recon_plucker = model_output
         gt_plucker = batch[self.plucker_key].to(recon_plucker.device)
 
         # Plucker reconstruction loss (MSE)
@@ -964,14 +965,20 @@ class DirectPluckerVAETrainer(BaseVAETrainer):
               f"constraint_weight={plucker_constraint_weight}")
 
     def _get_model_output(self, batch: Dict[str, Any]) -> Tuple:
-        """Get model output including Plucker reconstruction."""
+        """
+        Get model output including Plucker reconstruction.
+
+        Returns:
+            Tuple of (recon_img, posterior, recon_plucker)
+            Note: Order is (reconstruction, posterior, ...) for base trainer compatibility
+        """
         inputs = self.get_input(batch, self.image_key)
         gt_plucker = batch[self.plucker_key].to(inputs.device)
 
         recon_img, recon_plucker, posterior = self.model(
             inputs, gt_plucker, sample_posterior=True
         )
-        return recon_img, recon_plucker, posterior
+        return recon_img, posterior, recon_plucker
 
     def _compute_additional_losses(
         self,
@@ -980,7 +987,7 @@ class DirectPluckerVAETrainer(BaseVAETrainer):
         split: str = "train"
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Compute Plucker reconstruction and constraint losses."""
-        recon_img, recon_plucker, posterior = model_output
+        recon_img, posterior, recon_plucker = model_output
         gt_plucker = batch[self.plucker_key].to(recon_plucker.device)
 
         # Split Plucker into direction and moment for detailed loss
