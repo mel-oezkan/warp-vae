@@ -15,9 +15,9 @@
 #     --output_name vanilla2-1 
 
 # python compare_latents.py \
-#     --checkpoint weights/model.ckpt \
-#     --config config/test.yml \
-#     --output_name vanilla1-5
+#     --checkpoint weights/f8/model.ckpt \
+#     --config config/baseVAE.yaml \
+#     --output_name vanilla-1.5_f8
 
 
 # python compare_latents.py \
@@ -25,7 +25,17 @@
 #     --config config/warp_vae_co3d_small.yaml \
 #     --output_name pastel-chirpy
 
+# ------------------------------------------------
+#             warp_vae_co3d_precomputed
+# ------------------------------------------------
+
+# python compare_latents.py \
+#     --checkpoint checkpoints/slick-sidewinder-of-simple-justice/last.ckpt \
+#     --config config/warp_vae_co3d_precomputed.yaml \
+#     --output_name slick-sidewinder
+
+
 python compare_latents.py \
-    --checkpoint checkpoints/feathered-gay-pillbug-of-pizza/vae-epochepoch=049.ckpt \
-    --config config/warp_vae_co3d.yaml \
-    --output_name feathered-gay-pillbug
+    --checkpoint checkpoints/massive-accurate-okapi-of-blizzard/last.ckpt \
+    --config config/warp_vae_co3d_precomputed.yaml \
+    --output_name massive-accurate-okapi
