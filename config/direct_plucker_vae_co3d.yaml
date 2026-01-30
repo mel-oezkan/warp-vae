@@ -80,8 +80,8 @@ training:
   lpips_loss_weight: 1.0
   disc_lr: 4.5e-6
   ema_decay: 0.9999
-  val_split: 0.1
-  precision: 16
+  val_split: 0.2
+  precision: 32
   output_dir: "./outputs/direct_plucker_vae_co3d"
   note: "DirectPluckerVAE (Variant 2) - Unified latent prediction"
 
