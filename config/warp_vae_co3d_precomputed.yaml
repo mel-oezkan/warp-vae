@@ -43,7 +43,7 @@ model:
     lossconfig:
       target: ldm.modules.losses.LPIPSWithDiscriminator
       params:
-        disc_start: 50001
+        disc_start: 10000
         kl_weight: ${training.kl_weight}
         disc_weight: 0.5
         perceptual_weight: ${training.lpips_loss_weight}
@@ -61,8 +61,8 @@ trainer:
     bidirectional: true
     confidence_weighted: true
     loss_confidence_threshold: 0.1
-    warmup_steps: 5000
-    vanilla_probability: 0.2
+    warmup_steps: 1000
+    vanilla_probability: 0
     gradient_accumulation_steps: ${training.gradient_accumulation_steps}
 
 data:
@@ -75,7 +75,7 @@ data:
         bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
         warp_dir: "/data/lab_moezkan/precomputed_warps/toybus"  # Precomputed warp files
         image_size: ${training.image_size}
-        confidence_threshold: 0.1           # Threshold for valid correspondences
+        confidence_threshold: 0.25           # Threshold for valid correspondences
     batch_size: ${training.batch_size}
     val_split: ${training.val_split}
     num_workers: ${training.num_workers}
@@ -87,10 +87,10 @@ training:
   batch_size: 2                             # Can increase! No RoMaV2 memory overhead
   image_size: 256
   num_workers: 4                            # Can use workers now! No CUDA in dataloader
-  val_split: 0.1
+  val_split: 0.2
   num_epochs: 8
-  lr: 1e-6
-  kl_weight: 0.000001
+  lr: 1e-4                                  # Increased from 1e-6 for faster convergence
+  kl_weight: 1e-04                          # Increased from 1e-6 for better latent regularization
   lpips_loss_weight: 1.0
   ema_decay: 0.9999
   precision: 32
