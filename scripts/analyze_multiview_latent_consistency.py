@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgba
@@ -51,6 +50,7 @@ from src.analysis import (
     encode_images,
     denormalize,
     compute_latent_similarity,
+    compute_pairwise_similarity_matrices,
     load_camera_data,
     extract_camera_positions,
     compute_angular_separation,
@@ -178,26 +178,11 @@ def encode_object_views(
             latents.append(latent)
 
         # Compute pairwise similarity matrices
-        cos_sim_matrix = np.zeros((n_views, n_views))
-        mse_matrix = np.zeros((n_views, n_views))
-
-        for i in range(n_views):
-            for j in range(n_views):
-                if i == j:
-                    cos_sim_matrix[i, j] = 1.0
-                    mse_matrix[i, j] = 0.0
-                else:
-                    flat_i = latents[i].flatten()
-                    flat_j = latents[j].flatten()
-                    cos_sim_matrix[i, j] = F.cosine_similarity(
-                        flat_i.unsqueeze(0), flat_j.unsqueeze(0)
-                    ).item()
-                    mse_matrix[i, j] = F.mse_loss(latents[i], latents[j]).item()
+        matrices = compute_pairwise_similarity_matrices(latents)
 
         results[model_name] = {
             "latents": latents,
-            "cos_sim_matrix": cos_sim_matrix,
-            "mse_matrix": mse_matrix,
+            **matrices,
         }
 
     # Add shared data (same for all models)
@@ -218,7 +203,7 @@ def visualize_model_comparison(
     model_colors: Dict[str, str]
 ):
     """Create main comparison visualization across all models."""
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig, axes = plt.subplots(3, 3, figsize=(18, 16))
 
     model_names = list(all_results.keys())
 
@@ -266,22 +251,57 @@ def visualize_model_comparison(
     ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.3)
 
-    # Plot 3: Box plot comparison
+    # Plot 3: MAE vs Angular Separation (scatter + trend)
     ax3 = axes[0, 2]
+    for model_name in model_names:
+        results = all_results[model_name]
+        angles = [r["angular_separation"] for r in results]
+        mae_values = [r["mae"] for r in results]
+        color = model_colors[model_name]
+
+        ax3.scatter(angles, mae_values, alpha=0.3, s=10, color=color, label=model_name)
+
+        if len(angles) > 3:
+            z = np.polyfit(angles, mae_values, 2)
+            x_line = np.linspace(min(angles), max(angles), 100)
+            ax3.plot(x_line, np.poly1d(z)(x_line), '-', color=color, linewidth=2, alpha=0.8)
+
+    ax3.set_xlabel("Angular Separation (degrees)")
+    ax3.set_ylabel("Latent MAE")
+    ax3.set_title("Latent MAE vs Camera Angle")
+    ax3.legend(loc='upper left')
+    ax3.grid(True, alpha=0.3)
+
+    # Plot 4: Box plot comparison (Cosine Similarity)
+    ax4 = axes[1, 0]
     box_data = [
         [r["cosine_similarity"] for r in all_results[name]]
         for name in model_names
     ]
-    bp = ax3.boxplot(box_data, labels=model_names, patch_artist=True)
+    bp = ax4.boxplot(box_data, labels=model_names, patch_artist=True)
     for patch, name in zip(bp['boxes'], model_names):
         patch.set_facecolor(to_rgba(model_colors[name], 0.6))
-    ax3.set_ylabel("Cosine Similarity")
-    ax3.set_title("Overall Similarity Distribution")
-    ax3.grid(True, alpha=0.3, axis='y')
-    plt.setp(ax3.xaxis.get_majorticklabels(), rotation=20, ha='right')
+    ax4.set_ylabel("Cosine Similarity")
+    ax4.set_title("Cosine Similarity Distribution")
+    ax4.grid(True, alpha=0.3, axis='y')
+    plt.setp(ax4.xaxis.get_majorticklabels(), rotation=20, ha='right')
 
-    # Plot 4: Binned cosine similarity comparison
-    ax4 = axes[1, 0]
+    # Plot 5: Box plot comparison (MAE)
+    ax5 = axes[1, 1]
+    box_data_mae = [
+        [r["mae"] for r in all_results[name]]
+        for name in model_names
+    ]
+    bp_mae = ax5.boxplot(box_data_mae, labels=model_names, patch_artist=True)
+    for patch, name in zip(bp_mae['boxes'], model_names):
+        patch.set_facecolor(to_rgba(model_colors[name], 0.6))
+    ax5.set_ylabel("MAE")
+    ax5.set_title("MAE Distribution")
+    ax5.grid(True, alpha=0.3, axis='y')
+    plt.setp(ax5.xaxis.get_majorticklabels(), rotation=20, ha='right')
+
+    # Plot 6: Binned cosine similarity comparison
+    ax6 = axes[1, 2]
     angle_bins = [(0, 15), (15, 30), (30, 45), (45, 60), (60, 90)]
     bin_labels = [f"{low}-{high}°" for low, high in angle_bins]
     x = np.arange(len(bin_labels))
@@ -297,19 +317,19 @@ def visualize_model_comparison(
             stds.append(np.std(bin_vals) if bin_vals else 0)
 
         offset = (idx - len(model_names)/2 + 0.5) * width
-        ax4.bar(x + offset, means, width, yerr=stds, label=model_name,
+        ax6.bar(x + offset, means, width, yerr=stds, label=model_name,
                 color=model_colors[model_name], alpha=0.7, capsize=2)
 
-    ax4.set_xticks(x)
-    ax4.set_xticklabels(bin_labels)
-    ax4.set_xlabel("Angular Separation Range")
-    ax4.set_ylabel("Mean Cosine Similarity")
-    ax4.set_title("Cosine Similarity by Angle Bin")
-    ax4.legend()
-    ax4.grid(True, alpha=0.3, axis='y')
+    ax6.set_xticks(x)
+    ax6.set_xticklabels(bin_labels)
+    ax6.set_xlabel("Angular Separation Range")
+    ax6.set_ylabel("Mean Cosine Similarity")
+    ax6.set_title("Cosine Similarity by Angle Bin")
+    ax6.legend()
+    ax6.grid(True, alpha=0.3, axis='y')
 
-    # Plot 5: Binned MSE comparison
-    ax5 = axes[1, 1]
+    # Plot 7: Binned MSE comparison
+    ax7 = axes[2, 0]
     for idx, model_name in enumerate(model_names):
         results = all_results[model_name]
         means = []
@@ -320,20 +340,43 @@ def visualize_model_comparison(
             stds.append(np.std(bin_vals) if bin_vals else 0)
 
         offset = (idx - len(model_names)/2 + 0.5) * width
-        ax5.bar(x + offset, means, width, yerr=stds, label=model_name,
+        ax7.bar(x + offset, means, width, yerr=stds, label=model_name,
                 color=model_colors[model_name], alpha=0.7, capsize=2)
 
-    ax5.set_xticks(x)
-    ax5.set_xticklabels(bin_labels)
-    ax5.set_xlabel("Angular Separation Range")
-    ax5.set_ylabel("Mean MSE")
-    ax5.set_title("Latent MSE by Angle Bin")
-    ax5.legend()
-    ax5.grid(True, alpha=0.3, axis='y')
+    ax7.set_xticks(x)
+    ax7.set_xticklabels(bin_labels)
+    ax7.set_xlabel("Angular Separation Range")
+    ax7.set_ylabel("Mean MSE")
+    ax7.set_title("Latent MSE by Angle Bin")
+    ax7.legend()
+    ax7.grid(True, alpha=0.3, axis='y')
 
-    # Plot 6: Summary statistics table
-    ax6 = axes[1, 2]
-    ax6.axis('off')
+    # Plot 8: Binned MAE comparison
+    ax8 = axes[2, 1]
+    for idx, model_name in enumerate(model_names):
+        results = all_results[model_name]
+        means = []
+        stds = []
+        for low, high in angle_bins:
+            bin_vals = [r["mae"] for r in results if low <= r["angular_separation"] < high]
+            means.append(np.mean(bin_vals) if bin_vals else 0)
+            stds.append(np.std(bin_vals) if bin_vals else 0)
+
+        offset = (idx - len(model_names)/2 + 0.5) * width
+        ax8.bar(x + offset, means, width, yerr=stds, label=model_name,
+                color=model_colors[model_name], alpha=0.7, capsize=2)
+
+    ax8.set_xticks(x)
+    ax8.set_xticklabels(bin_labels)
+    ax8.set_xlabel("Angular Separation Range")
+    ax8.set_ylabel("Mean MAE")
+    ax8.set_title("Latent MAE by Angle Bin")
+    ax8.legend()
+    ax8.grid(True, alpha=0.3, axis='y')
+
+    # Plot 9: Summary statistics table
+    ax9 = axes[2, 2]
+    ax9.axis('off')
 
     table_data = []
     headers = ["Metric"] + [name[:12] for name in model_names]
@@ -345,12 +388,15 @@ def visualize_model_comparison(
         angles = [r["angular_separation"] for r in results]
         cos_vals = [r["cosine_similarity"] for r in results]
         mse_vals = [r["mse"] for r in results]
+        mae_vals = [r["mae"] for r in results]
 
         stats[model_name] = {
             "n_pairs": len(results),
             "cos_mean": np.mean(cos_vals),
             "cos_std": np.std(cos_vals),
             "mse_mean": np.mean(mse_vals),
+            "mae_mean": np.mean(mae_vals),
+            "mae_std": np.std(mae_vals),
             "angle_cos_corr": np.corrcoef(angles, cos_vals)[0, 1] if len(angles) > 1 else 0,
         }
 
@@ -358,14 +404,16 @@ def visualize_model_comparison(
     table_data.append(["Cos Sim (mean)"] + [f"{stats[n]['cos_mean']:.4f}" for n in model_names])
     table_data.append(["Cos Sim (std)"] + [f"{stats[n]['cos_std']:.4f}" for n in model_names])
     table_data.append(["MSE (mean)"] + [f"{stats[n]['mse_mean']:.4f}" for n in model_names])
+    table_data.append(["MAE (mean)"] + [f"{stats[n]['mae_mean']:.4f}" for n in model_names])
+    table_data.append(["MAE (std)"] + [f"{stats[n]['mae_std']:.4f}" for n in model_names])
     table_data.append(["Angle-Cos Corr"] + [f"{stats[n]['angle_cos_corr']:.4f}" for n in model_names])
 
-    table = ax6.table(cellText=table_data, colLabels=headers,
+    table = ax9.table(cellText=table_data, colLabels=headers,
                      loc='center', cellLoc='center')
     table.auto_set_font_size(False)
     table.set_fontsize(9)
     table.scale(1.2, 1.8)
-    ax6.set_title("Summary Statistics", pad=20)
+    ax9.set_title("Summary Statistics", pad=20)
 
     plt.suptitle("Multi-View Latent Consistency: Model Comparison", fontsize=14, fontweight='bold')
     plt.tight_layout()
@@ -465,8 +513,8 @@ def visualize_similarity_matrices(
     model_names = list(models_data.keys())
     n_models = len(model_names)
 
-    # Create figure: 2 rows (cos_sim, mse) x (1 + n_models) columns
-    fig, axes = plt.subplots(2, 1 + n_models, figsize=(4*(1+n_models), 8))
+    # Create figure: 3 rows (cos_sim, mse, mae) x (1 + n_models) columns
+    fig, axes = plt.subplots(3, 1 + n_models, figsize=(4*(1+n_models), 11))
 
     # Column 0: Angular separation matrix
     im0 = axes[0, 0].imshow(angular_sep, cmap='viridis', aspect='equal')
@@ -476,11 +524,13 @@ def visualize_similarity_matrices(
     plt.colorbar(im0, ax=axes[0, 0], shrink=0.8)
 
     axes[1, 0].axis('off')  # Empty cell
+    axes[2, 0].axis('off')  # Empty cell
 
     # Columns 1 to n_models: Similarity matrices for each model
     for col, model_name in enumerate(model_names, start=1):
         cos_matrix = models_data[model_name]["cos_sim_matrix"]
         mse_matrix = models_data[model_name]["mse_matrix"]
+        mae_matrix = models_data[model_name]["mae_matrix"]
 
         # Cosine similarity
         im1 = axes[0, col].imshow(cos_matrix, cmap='RdYlGn', aspect='equal', vmin=0.5, vmax=1.0)
@@ -493,6 +543,12 @@ def visualize_similarity_matrices(
         axes[1, col].set_title(f"{model_name}\nMSE")
         axes[1, col].set_xlabel("View")
         plt.colorbar(im2, ax=axes[1, col], shrink=0.8)
+
+        # MAE
+        im3 = axes[2, col].imshow(mae_matrix, cmap='hot', aspect='equal')
+        axes[2, col].set_title(f"{model_name}\nMAE")
+        axes[2, col].set_xlabel("View")
+        plt.colorbar(im3, ax=axes[2, col], shrink=0.8)
 
     plt.suptitle(f"Similarity Matrices: {obj_name}", fontsize=14, fontweight='bold')
     plt.tight_layout()
@@ -516,7 +572,7 @@ def visualize_angle_vs_similarity_per_object(
 
     model_names = list(models_data.keys())
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
     # Extract upper triangle indices
     triu_idx = np.triu_indices(n_views, k=1)
@@ -563,6 +619,26 @@ def visualize_angle_vs_similarity_per_object(
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
+    # Plot MAE
+    ax3 = axes[2]
+    for model_name in model_names:
+        mae_matrix = models_data[model_name]["mae_matrix"]
+        mae_flat = mae_matrix[triu_idx]
+        color = model_colors[model_name]
+
+        ax3.scatter(angles_flat, mae_flat, alpha=0.5, s=30, color=color, label=model_name)
+
+        if len(angles_flat) > 3:
+            z = np.polyfit(angles_flat, mae_flat, 2)
+            x_line = np.linspace(min(angles_flat), max(angles_flat), 100)
+            ax3.plot(x_line, np.poly1d(z)(x_line), '-', color=color, linewidth=2, alpha=0.8)
+
+    ax3.set_xlabel("Angular Separation (°)")
+    ax3.set_ylabel("MAE")
+    ax3.set_title("MAE vs Angle")
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
     plt.suptitle(f"Angle vs Similarity: {obj_name}", fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(output_dir / f"angle_vs_sim_{obj_name}.png", dpi=150, bbox_inches='tight')
@@ -586,6 +662,7 @@ def save_comparison_stats(
             angles = [r["angular_separation"] for r in results]
             cos_values = [r["cosine_similarity"] for r in results]
             mse_values = [r["mse"] for r in results]
+            mae_values = [r["mae"] for r in results]
 
             f.write(f"Model: {model_name}\n")
             f.write("-" * 50 + "\n")
@@ -599,12 +676,17 @@ def save_comparison_stats(
             f.write("\n  MSE:\n")
             f.write(f"    Mean: {np.mean(mse_values):.4f}\n")
             f.write(f"    Std:  {np.std(mse_values):.4f}\n")
+            f.write("\n  MAE:\n")
+            f.write(f"    Mean: {np.mean(mae_values):.4f}\n")
+            f.write(f"    Std:  {np.std(mae_values):.4f}\n")
+            f.write(f"    Min:  {min(mae_values):.4f}\n")
+            f.write(f"    Max:  {max(mae_values):.4f}\n")
 
             corr = np.corrcoef(angles, cos_values)[0, 1] if len(angles) > 1 else 0
             f.write(f"\n  Correlation(angle, cos_sim): {corr:.4f}\n")
             f.write("\n")
 
-        # Binned comparison
+        # Binned comparison (Cosine Similarity)
         f.write("\nBinned Comparison (Cosine Similarity)\n")
         f.write("=" * 70 + "\n")
 
@@ -619,6 +701,24 @@ def save_comparison_stats(
             for model_name in model_names:
                 results = all_results[model_name]
                 bin_vals = [r["cosine_similarity"] for r in results if low <= r["angular_separation"] < high]
+                if bin_vals:
+                    row += f"{np.mean(bin_vals):.3f}±{np.std(bin_vals):.3f}".ljust(14)
+                else:
+                    row += "N/A".ljust(14)
+            f.write(row + "\n")
+
+        # Binned comparison (MAE)
+        f.write("\n\nBinned Comparison (MAE)\n")
+        f.write("=" * 70 + "\n")
+
+        f.write(header + "\n")
+        f.write("-" * len(header) + "\n")
+
+        for low, high in angle_bins:
+            row = f"{low}-{high}°".ljust(12)
+            for model_name in model_names:
+                results = all_results[model_name]
+                bin_vals = [r["mae"] for r in results if low <= r["angular_separation"] < high]
                 if bin_vals:
                     row += f"{np.mean(bin_vals):.3f}±{np.std(bin_vals):.3f}".ljust(14)
                 else:
