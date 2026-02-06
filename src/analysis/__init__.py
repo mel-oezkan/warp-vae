@@ -11,6 +11,7 @@ from .model_utils import (
 from .latent_metrics import (
     compute_latent_similarity,
     compute_sequence_consistency,
+    compute_pairwise_similarity_matrices,
     compute_latent_stats,
 )
 
@@ -29,6 +30,16 @@ from .visualization import (
     visualize_latent_pca,
 )
 
+from .roma_metrics import (
+    load_roma_model,
+    compute_roma_correspondences,
+    warp_to_latent_warp,
+    confidence_to_latent_mask,
+    warp_latent,
+    compute_region_similarity,
+    compute_bidirectional_region_similarity,
+)
+
 __all__ = [
     # Model utilities
     "load_model",
@@ -39,6 +50,7 @@ __all__ = [
     # Latent metrics
     "compute_latent_similarity",
     "compute_sequence_consistency",
+    "compute_pairwise_similarity_matrices",
     "compute_latent_stats",
     # Camera utilities
     "load_camera_data",
@@ -51,4 +63,12 @@ __all__ = [
     "visualize_reconstructions",
     "visualize_latent_channels",
     "visualize_latent_pca",
+    # RoMA metrics
+    "load_roma_model",
+    "compute_roma_correspondences",
+    "warp_to_latent_warp",
+    "confidence_to_latent_mask",
+    "warp_latent",
+    "compute_region_similarity",
+    "compute_bidirectional_region_similarity",
 ]

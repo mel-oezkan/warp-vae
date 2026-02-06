@@ -114,6 +114,42 @@ def compute_sequence_consistency(latents: List[torch.Tensor]) -> Dict[str, float
     }
 
 
+def compute_pairwise_similarity_matrices(latents: List[torch.Tensor]) -> Dict[str, np.ndarray]:
+    """Compute pairwise cosine similarity, MSE, and MAE matrices for a list of latents.
+
+    Args:
+        latents: List of latent tensors, each (1, C, H, W)
+
+    Returns:
+        Dictionary with 'cos_sim_matrix', 'mse_matrix', and 'mae_matrix' numpy arrays of shape (N, N)
+    """
+    n = len(latents)
+    cos_sim_matrix = np.zeros((n, n))
+    mse_matrix = np.zeros((n, n))
+    mae_matrix = np.zeros((n, n))
+
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                cos_sim_matrix[i, j] = 1.0
+                mse_matrix[i, j] = 0.0
+                mae_matrix[i, j] = 0.0
+            else:
+                flat_i = latents[i].flatten()
+                flat_j = latents[j].flatten()
+                cos_sim_matrix[i, j] = F.cosine_similarity(
+                    flat_i.unsqueeze(0), flat_j.unsqueeze(0)
+                ).item()
+                mse_matrix[i, j] = F.mse_loss(latents[i], latents[j]).item()
+                mae_matrix[i, j] = F.l1_loss(latents[i], latents[j]).item()
+
+    return {
+        "cos_sim_matrix": cos_sim_matrix,
+        "mse_matrix": mse_matrix,
+        "mae_matrix": mae_matrix,
+    }
+
+
 def compute_latent_stats(latents: torch.Tensor, name: str) -> Dict:
     """Compute statistics for latent representations.
 
