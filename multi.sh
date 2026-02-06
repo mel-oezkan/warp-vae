@@ -58,4 +58,25 @@ python scripts/analyze_multiview_latent_consistency.py \
         config/checkpoints/eq-vae/config.json \
         config/baseVAE.yaml \
     --model_names "WARP-VAE" "EQ-VAE" "SD-VAE" \
-    --output_name multi_model_comparison
+    --mode roma \
+    --roma_setting fast \
+    --max_angle 90 \
+    --output_name full_comparison90
+
+# # RoMA mode only
+# python scripts/analyze_multiview_latent_consistency.py \
+#     --checkpoints weights/f8/model.ckpt \
+#     --configs config/baseVAE.yaml \
+#     --model_names "Baseline" \
+#     --mode roma \
+#     --roma_setting precise \
+#     --roma_confidence_threshold 0.8 \
+#     --output_name roma_analysis
+
+# # Both global and RoMA analysis
+# python scripts/analyze_multiview_latent_consistency.py \
+#     --checkpoints model1.ckpt model2.ckpt \
+#     --configs config1.yaml config2.yaml \
+#     --model_names "Model A" "Model B" \
+#     --mode both \
+#     --output_name full_comparison
