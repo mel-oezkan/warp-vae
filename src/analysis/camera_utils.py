@@ -1,5 +1,6 @@
 """Camera and multi-view geometry utilities."""
 
+import gzip
 import json
 from typing import List, Tuple
 import numpy as np
@@ -10,6 +11,43 @@ def load_camera_data(transforms_path: str) -> dict:
     with open(transforms_path) as f:
         data = json.load(f)
     return data
+
+
+def load_co3d_annotations(annotation_path: str) -> dict:
+    """Load CO3D preprocessed annotations from .jgz file.
+
+    Args:
+        annotation_path: Path to a preprocessed .jgz annotation file
+            (e.g. hydrant_train.jgz produced by preprocess_co3d.py)
+
+    Returns:
+        Dictionary mapping sequence_name -> list of frame dicts.
+        Each frame dict has: filepath, R, T, focal_length, principal_point, bbox
+    """
+    with gzip.open(annotation_path, "r") as f:
+        data = json.loads(f.read())
+    return data
+
+
+def extract_co3d_camera_positions(frames: list) -> np.ndarray:
+    """Extract camera world positions from CO3D W2C (R, T) format.
+
+    CO3D convention: R is 3x3 world-to-camera rotation, T is 3D W2C translation.
+    Camera world position = -R^T @ T
+
+    Args:
+        frames: List of frame dicts with 'R' and 'T' keys
+
+    Returns:
+        Array of shape (N, 3) with camera world positions
+    """
+    positions = []
+    for frame in frames:
+        R = np.array(frame["R"])
+        T = np.array(frame["T"])
+        pos = -R.T @ T
+        positions.append(pos)
+    return np.array(positions)
 
 
 def extract_camera_positions(camera_data: dict) -> np.ndarray:
@@ -55,6 +93,66 @@ def compute_angular_separation(positions: np.ndarray) -> np.ndarray:
                 angular_sep[i, j] = np.arccos(cos_angle) * 180 / np.pi
 
     return angular_sep
+
+
+def compute_camera_distance_matrix(frames: list) -> np.ndarray:
+    """Compute pairwise Euclidean distance matrix between camera positions.
+
+    Unlike angular separation, this captures both rotational and
+    translational differences (e.g. camera moving closer/farther from object).
+
+    Args:
+        frames: List of frame dicts with 'R' and 'T' keys
+
+    Returns:
+        Distance matrix of shape (N, N)
+    """
+    positions = extract_co3d_camera_positions(frames)
+    diff = positions[:, None, :] - positions[None, :, :]
+    return np.linalg.norm(diff, axis=-1)
+
+
+def compute_relative_pose_distance(
+    frames: list,
+    weight_rotation: float = 1.0,
+    weight_translation: float = 1.0,
+) -> np.ndarray:
+    """Compute pairwise pose distance combining rotation and translation.
+
+    Rotation distance is the geodesic angle (degrees) between R_i and R_j.
+    Translation distance is Euclidean distance between camera centers.
+    Both are normalized to [0, 1] before weighting.
+
+    Args:
+        frames: List of frame dicts with 'R' and 'T' keys
+        weight_rotation: Weight for rotation component
+        weight_translation: Weight for translation component
+
+    Returns:
+        Combined distance matrix of shape (N, N)
+    """
+    n = len(frames)
+    Rs = [np.array(f["R"]) for f in frames]
+    positions = extract_co3d_camera_positions(frames)
+
+    rot_dist = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            # Relative rotation: R_rel = R_i @ R_j^T
+            R_rel = Rs[i] @ Rs[j].T
+            # Geodesic angle: arccos((trace(R_rel) - 1) / 2)
+            trace = np.clip(np.trace(R_rel), -1.0, 3.0)
+            angle = np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
+            rot_dist[i, j] = rot_dist[j, i] = np.degrees(angle)
+
+    diff = positions[:, None, :] - positions[None, :, :]
+    trans_dist = np.linalg.norm(diff, axis=-1)
+
+    # Normalize each to [0, 1]
+    rot_norm = rot_dist / (rot_dist.max() + 1e-8)
+    trans_norm = trans_dist / (trans_dist.max() + 1e-8)
+
+    return weight_rotation * rot_norm + weight_translation * trans_norm
 
 
 def find_overlapping_pairs(
