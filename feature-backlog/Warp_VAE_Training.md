@@ -110,53 +110,57 @@ The trainer combines standard VAE losses with warp consistency loss.
 ```python
 class WarpVAETrainer(BaseVAETrainer):
     """
-    VAE trainer with warp consistency loss for multi-view consistency.
+    VAE trainer with warp consistency loss + gradient accumulation.
 
-    Total Loss = AE_Loss + warp_weight * Warp_Consistency_Loss
+    Total Loss = AE_Loss + warp_weight * warp_factor * Warp_Consistency_Loss
 
     Where AE_Loss = Reconstruction + KL + Perceptual + (Discriminator)
     """
 
     def training_step(self, batch, batch_idx):
-        # 1. Get source and target images
-        img_a = batch["image"]
-        img_b = batch["image_target"]
-
-        # 2. Encode and reconstruct source
-        recon_a, posterior_a = self.model(img_a)
+        # 1. Encode source → reconstruction + posterior + latent_a
+        recon_a, posterior_a = self.model(img_a, sample_posterior=True)
         latent_a = posterior_a.sample()
 
-        # 3. Encode target (no reconstruction needed)
-        latent_b = self.model.encode(img_b).sample()
+        # 2. Decide whether to skip warp loss (vanilla_probability)
+        use_vanilla_only = torch.rand(1).item() < self.vanilla_probability
 
-        # 4. Compute standard VAE loss
+        # 3. Compute standard VAE loss
         ae_loss = self.model.loss(img_a, recon_a, posterior_a, ...)
 
-        # 5. Compute warp consistency loss
-        warp_loss = self.warp_loss(
-            latent_a, latent_b,
-            batch["warp_ab"], batch["warp_ba"],
-            batch["confidence_ab"], batch["confidence_ba"]
-        )
+        # 4. Compute warp consistency loss (if not vanilla mode)
+        if not use_vanilla_only:
+            latent_b = self.model.encode(img_b).sample()
+            warp_loss = self.warp_consistency_loss(
+                latent_a, latent_b, warp_ab, warp_ba, conf_ab, conf_ba
+            )
 
-        # 6. Combine losses with warmup
-        warp_weight = self.get_warp_weight(global_step)  # Ramps up
-        total_loss = ae_loss + warp_weight * warp_loss
+        # 5. Combine with warmup factor
+        warp_factor = min(1.0, global_step / warmup_steps)
+        total_loss = ae_loss + warp_weight * warp_factor * warp_loss
 
-        return total_loss
+        # 6. Gradient accumulation: scale and accumulate
+        scaled_loss = total_loss / gradient_accumulation_steps
+        self.manual_backward(scaled_loss)
+        if (batch_idx + 1) % gradient_accumulation_steps == 0:
+            opt_ae.step()
+            opt_ae.zero_grad()
+
+        # 7. Same pattern for discriminator optimizer
 ```
 
 **Key Parameters:**
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `warp_consistency_weight` | Weight for warp loss | 0.5 - 1.0 |
-| `warp_reconstruction_weight` | Weight for warp recon loss | 0.0 |
-| `consistency_loss_type` | `"l1"` or `"l2"` | `"l1"` |
+| `warp_consistency_weight` | Weight for warp loss | 1.0 |
+| `warp_reconstruction_weight` | Weight for image-space warp loss | 0.0 |
+| `consistency_loss_type` | `"l1"`, `"l2"`, `"cosine"`, `"combined"` | `"l1"` |
 | `bidirectional` | Compute both A→B and B→A | `true` |
 | `confidence_weighted` | Weight by RoMaV2 confidence | `true` |
-| `confidence_threshold` | Min confidence for loss | 0.1 |
-| `warmup_steps` | Steps to ramp up warp weight | 1000 |
-| `vanilla_probability` | Probability of using vanilla loss only (no warp loss) | 0.0 |
+| `loss_confidence_threshold` | Min confidence for loss computation | 0.2 |
+| `warmup_steps` | Steps to linearly ramp up warp weight | 5000 |
+| `vanilla_probability` | Probability of skipping warp loss | 0.0 |
+| `gradient_accumulation_steps` | Mini-batches to accumulate before update | 4 |
 
 ## Configuration
 
@@ -292,168 +296,107 @@ loss = (|warped_latent - target_latent| * confidence).sum() / confidence.sum()
 
 ### 1. CUDA in DataLoader Workers
 
-RoMaV2 uses CUDA, which cannot be used in forked DataLoader workers. **Must set `num_workers=0`**.
+RoMaV2 uses CUDA, which cannot be used in forked DataLoader workers. **Must set `num_workers=0`** for online warps (`WarpCO3DDataset`).
 
 ```yaml
+# Online warps (WarpCO3DDataset):
 data:
   params:
     num_workers: 0  # Required for RoMaV2
+
+# Precomputed warps (PrecomputedWarpDataset) - no restriction:
+data:
+  params:
+    num_workers: 4  # Parallel loading OK, no CUDA in dataloader
 ```
+
+**This is the primary motivation for precomputing warps** - it eliminates the CUDA-in-workers constraint and enables parallel data loading.
 
 ### 2. Memory Considerations
 
-**Small Model (warp_vae_co3d_small):**
-- VAE model (ch=64): ~0.1GB VRAM
-- RoMaV2 model: ~2GB VRAM
-- Training batch (bs=8, 128×128): ~3GB VRAM
-- **Total**: ~5-6GB per GPU
+**Precomputed Config (warp_vae_co3d_precomputed) - Recommended:**
+- VAE model (ch=128): ~0.3GB VRAM
+- No RoMaV2 during training: 0 GB
+- Training batch (bs=2, 256×256): ~6GB VRAM
+- **Total**: ~6-8GB per GPU
 
-**Full Model (warp_vae_co3d):**
+**Online Full Model (warp_vae_co3d):**
 - VAE model (ch=128): ~0.3GB VRAM
 - RoMaV2 model: ~2GB VRAM
 - Training batch (bs=2, 256×256): ~6GB VRAM
 - **Total**: ~8-10GB per GPU (fits on GTX 1080 Ti)
 
-| Config | Batch Size | Peak VRAM (training) |
-|--------|------------|----------------------|
-| `warp_vae_co3d_small` | 8 | ~5GB |
-| `warp_vae_co3d` | 2 | ~8GB |
-| `warp_vae_co3d` | 4 | OOM on 11GB |
+**Online Small Model (warp_vae_co3d_small):**
+- VAE model (ch=64): ~0.1GB VRAM
+- RoMaV2 model: ~2GB VRAM
+- Training batch (bs=8, 128×128): ~3GB VRAM
+- **Total**: ~5-6GB per GPU
 
-### 3. Warp Warmup
+| Config | Batch Size | RoMaV2 | Peak VRAM |
+|--------|------------|--------|-----------|
+| `warp_vae_co3d_precomputed` | 2 | No | ~6-8GB |
+| `warp_vae_co3d_small` | 8 | Yes | ~5GB |
+| `warp_vae_co3d` | 2 | Yes | ~8GB |
+| `warp_vae_co3d` | 4 | Yes | OOM on 11GB |
 
-The warp loss weight ramps up gradually to prevent early training instability:
+### 3. Gradient Accumulation
 
-```python
-def get_warp_weight(self, step):
-    if step < self.warmup_steps:
-        return self.warp_weight * (step / self.warmup_steps)
-    return self.warp_weight
-```
-
-### 4. Latent Space Resolution
-
-The warp field is computed at image resolution but must be resized for latent space:
+The `WarpVAETrainer` supports gradient accumulation to simulate larger effective batch sizes without increasing memory:
 
 ```python
-# Image: 128x128 → Latent: 32x32 (with downsampling factor 4)
-warp_latent = F.interpolate(
-    warp_ab.permute(0, 3, 1, 2),  # [B, 2, H, W]
-    size=(32, 32),
-    mode="bilinear"
-).permute(0, 2, 3, 1)  # [B, 32, 32, 2]
+# gradient_accumulation_steps = 4, batch_size = 2
+# Effective batch size = 4 * 2 = 8
+
+# Loss is scaled: scaled_loss = total_loss / accumulation_steps
+# Optimizer steps only every N batches:
+if (batch_idx + 1) % gradient_accumulation_steps != 0:
+    # Accumulate gradients (no optimizer step)
+else:
+    opt.step()
+    opt.zero_grad()
 ```
 
-### 5. FP16 Numerical Stability
+Both the autoencoder and discriminator optimizers follow this pattern.
 
-When training with mixed precision (`precision: 16`), several measures are required to prevent NaN losses:
+### 4. Warp Warmup
 
-#### Gradient Clipping
-
-The trainer uses **manual optimization** (dual optimizers for autoencoder and discriminator), which means PyTorch Lightning's `gradient_clip_val` parameter cannot be used. Instead, gradient clipping is applied manually after `manual_backward()`:
+The warp loss weight ramps up linearly to prevent early training instability:
 
 ```python
-# In WarpVAETrainer.training_step():
-
-# Autoencoder optimization with gradient clipping
-opt_ae.zero_grad()
-self.manual_backward(total_ae_loss)
-torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-opt_ae.step()
-
-# Discriminator optimization with gradient clipping
-opt_disc.zero_grad()
-self.manual_backward(discloss)
-torch.nn.utils.clip_grad_norm_(self.model.loss.discriminator.parameters(), max_norm=1.0)
-opt_disc.step()
+# warp_factor = min(1.0, global_step / warmup_steps)
+# effective_weight = warp_consistency_weight * warp_factor
 ```
 
-#### Logvar Clamping in Loss Function
+With `warmup_steps=5000` (precomputed config), the warp loss reaches full weight at step 5000.
 
-The `LPIPSWithDiscriminator` loss function computes NLL loss using a learned `logvar` parameter. Without clamping, extreme `logvar` values can cause overflow/underflow in FP16:
+### 5. Latent Space Resolution
+
+The warp field is computed at image resolution but `WarpConsistencyLoss.warp_features()` automatically resizes it to latent resolution:
 
 ```python
-# In ldm/modules/losses/contperceptual.py:
-
-# Clamp logvar to prevent extreme values that cause overflow/underflow
-logvar_clamped = torch.clamp(self.logvar.float(), min=-10.0, max=10.0)
-nll_loss = rec_loss.float() / torch.exp(logvar_clamped) + logvar_clamped
+# Image: 256x256 → Latent: 32x32 (8x downsampling via ch_mult=[1,2,4,4])
+# The loss function handles this automatically:
+#   - Detects shape mismatch between warp and features
+#   - Resizes warp and confidence via F.interpolate (bilinear)
 ```
 
-**Why this matters:**
-- If `logvar` becomes very negative (e.g., -20), `torch.exp(logvar)` is ~1e-9
-- Dividing `rec_loss` by this tiny value causes overflow in FP16 (max ~65504)
-- The clamping range `[-10, 10]` keeps `exp(logvar)` in a safe range (~4.5e-5 to ~22026)
+### 6. FP16 Numerical Stability
 
-#### Summary of FP16 Stability Fixes
-
-| Issue | Symptom | Fix |
-|-------|---------|-----|
-| Exploding gradients | NaN loss after many steps | Manual gradient clipping (max_norm=1.0) |
-| Logvar overflow | NaN in nll_loss computation | Clamp logvar to [-10, 10] |
-| FP16 precision loss | Accumulated errors | Cast rec_loss to float32 before division |
+**Note:** The precomputed config defaults to `precision: 32` to avoid these issues entirely. This section applies when using `precision: 16`.
 
 ## Evaluation
 
-**File:** `eval_warp_vae.py`
+Evaluation is done via the `WarpVAETrainer.log_images()` method during training (logged to WandB), which generates:
+- **Source image**: Original input view
+- **Target image**: Paired view from different viewpoint
+- **Reconstruction**: VAE reconstruction of source
+- **Warped source**: Source image warped to target view via `F.grid_sample(warp_ab)`
+- **Warped reconstruction**: VAE reconstruction warped to target view
 
-The evaluation script visualizes:
-1. **Dataset samples**: Source/target pairs with warps
-2. **Warp flow fields**: Dense correspondence visualization
-3. **Model outputs**: Reconstructions and warped latents
-4. **Latent consistency**: Statistics over many samples
-
-Run evaluation:
-```bash
-# Without checkpoint (random init baseline)
-python eval_warp_vae.py --num_samples 4
-
-# With trained checkpoint
-python eval_warp_vae.py --checkpoint ./outputs/warp_vae_co3d_small/<run>/checkpoints/last.ckpt
-
-# Skip model evaluation (dataset-only)
-python eval_warp_vae.py --skip_model
-```
-
-### What the Evaluation Script Does
-
-The script produces 4 visualizations saved to `./eval_outputs/`:
-
-1. **Dataset Samples** (`dataset_samples.png`)
-   - Displays source/target image pairs from the CO3D dataset
-   - Warps the source image to the target view using RoMaV2 correspondences via `F.grid_sample()`
-   - Shows confidence masks (RoMaV2's certainty about correspondences)
-   - Computes pixel-wise warp error: `|warped_source - target|`
-   - Useful for validating that the dataset and warp fields are working correctly
-
-2. **Warp Flow Fields** (`warp_flow.png`)
-   - Converts RoMaV2's normalized grid coordinates to pixel displacements
-   - Visualizes flow magnitude as a heatmap (how far each pixel moves)
-   - Draws quiver plots showing flow direction vectors overlaid on the source image
-   - Helps diagnose warp quality and identify problematic regions
-
-3. **Model Outputs** (`model_outputs.png`)
-   - Runs the VAE encoder/decoder on source and target images
-   - Shows: source → reconstruction → target → warped source → warped reconstruction
-   - Computes **latent space difference maps**: warps `latent_a` to target view and compares with `latent_b`
-   - The latent diff heatmap is the key visualization - lower values = better 3D consistency
-
-4. **Latent Consistency Stats** (`latent_consistency.png`)
-   - Aggregates statistics over 100 random samples
-   - Plots histograms for three metrics:
-     - **Latent Consistency**: confidence-weighted L1 between `warp(latent_a) - latent_b` (primary metric)
-     - **Reconstruction L1**: standard VAE reconstruction quality
-     - **Warp L1 Error**: image-space warp quality (baseline sanity check)
-   - Reports mean ± std for each metric
-   - Use this to compare random init (~4.0 consistency) vs trained (<1.0 target)
-
-### Key Implementation Details
-
-- Loads `WarpCO3DDataset` with hardcoded paths matching training config
-- Creates VAE with same architecture as `warp_vae_co3d_small.yaml` (ch=64, ch_mult=[1,2,4])
-- Auto-detects latest checkpoint in `./outputs/warp_vae_co3d_small/` if none specified
-- Handles checkpoint format variations (strips `model.` prefix if present)
-- Disables `torch.compile` for older GPU compatibility
+Key metrics to track in WandB:
+- `train/warp_consistency_loss`: Primary multi-view consistency metric
+- `train/aeloss`: Standard VAE reconstruction quality
+- `val/warp_loss`: Validation warp consistency (generalization check)
 ## Training Commands
 
 ### Small Model (ch=64, for testing/limited VRAM)
@@ -472,6 +415,7 @@ python train.py --config-name=warp_vae_co3d
 ### Precomputed Warps (Recommended for Production)
 ```bash
 # Step 1: Precompute RoMaV2 warps (one-time, can run overnight)
+# Single GPU:
 python precompute_warps.py \
     --bb_file /data/lab_moezkan/co3d_bboxes/toybus_test.jgz \
     --output_dir /data/lab_moezkan/precomputed_warps/toybus \
@@ -481,8 +425,25 @@ python precompute_warps.py \
     --num_pairs_per_sample 3 \
     --warp_resolution 256
 
+# Multi-GPU (1.8-2.0x speedup with 2 GPUs):
+python precompute_warps.py \
+    --bb_file /data/lab_moezkan/co3d_bboxes/toybus_test.jgz \
+    --output_dir /data/lab_moezkan/precomputed_warps/toybus \
+    --root_dir /data/lab_moezkan/co3d_full \
+    --num_workers 2 --gpu_ids 0 1 \
+    --romav2_setting turbo \
+    --max_pair_distance 20 \
+    --num_pairs_per_sample 3
+
+# Resume interrupted computation:
+python precompute_warps.py \
+    --bb_file /data/lab_moezkan/co3d_bboxes/toybus_test.jgz \
+    --output_dir /data/lab_moezkan/precomputed_warps/toybus \
+    --root_dir /data/lab_moezkan/co3d_full \
+    --num_workers 2 --gpu_ids 0 1 --resume
+
 # Step 2: Train with precomputed warps (much faster!)
-python train.py --config-name=warp_vae_co3d_precomputed
+CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_co3d_precomputed
 ```
 
 ### Specifying GPUs (optional)
@@ -507,22 +468,22 @@ The precomputed warp pipeline separates the expensive RoMaV2 correspondence comp
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                    PRECOMPUTATION PHASE (One-time)                   │
+│                 PRECOMPUTATION PHASE (One-time, multi-GPU)            │
 ├──────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│  CO3D Dataset                                                        │
-│       │                                                              │
-│       ▼                                                              │
-│  ┌─────────────┐     ┌─────────────┐     ┌─────────────────────────┐ │
-│  │ Image Pairs │ ──► │   RoMaV2    │ ──► │  Precomputed Warps      │ │
-│  │  (A, B)     │     │   Model     │     │  warp_XXXXX_YYYYY.pt    │ │
-│  └─────────────┘     └─────────────┘     └─────────────────────────┘ │
+│  CO3D Dataset ──► Generate pair list ──► Split across N GPUs         │
 │                                                                      │
-│  Output per pair:                                                    │
+│  ┌─────────────────────┐  ┌─────────────────────┐                    │
+│  │ Worker 0 (GPU 0)    │  │ Worker 1 (GPU 1)    │  ...               │
+│  │ ├─ Load RoMaV2      │  │ ├─ Load RoMaV2      │                    │
+│  │ └─ Process batch 0  │  │ └─ Process batch 1  │                    │
+│  └─────────────────────┘  └─────────────────────┘                    │
+│                          │                                           │
+│                          ▼                                           │
+│  Output: warp_XXXXX_YYYYY.pt files + metadata.json                   │
 │    - warp_ab: (H, W, 2) normalized grid coordinates                  │
 │    - confidence_ab: (H, W) correspondence confidence                 │
-│    - warp_ba: (H, W, 2) reverse direction                            │
-│    - confidence_ba: (H, W) reverse confidence                        │
+│    - warp_ba / confidence_ba: reverse direction                      │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 
@@ -530,27 +491,21 @@ The precomputed warp pipeline separates the expensive RoMaV2 correspondence comp
 │                      TRAINING PHASE (Fast!)                          │
 ├──────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│  ┌─────────────────┐                                                 │
-│  │ DataLoader      │  num_workers=4, pin_memory=True                 │
-│  │ (parallel)      │                                                 │
-│  └────────┬────────┘                                                 │
+│  DataLoader (num_workers=4, pin_memory, persistent_workers)          │
 │           │                                                          │
 │           ▼                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │ PrecomputedWarpDataset                                          │ │
-│  │   - Load image pair from disk                                   │ │
-│  │   - Load precomputed warp from .pt file                         │ │
-│  │   - Resize warp if needed (with warning)                        │ │
-│  │   - Apply confidence threshold                                   │ │
-│  └─────────────────────────────────────────────────────────────────┘ │
+│  PrecomputedWarpDataset                                              │
+│    - Load image pair + precomputed warp from .pt file                │
+│    - Auto-resize warp if resolution mismatch                         │
+│    - Apply soft confidence threshold                                 │
 │           │                                                          │
 │           ▼                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │ WarpVAETrainer (same as online training)                        │ │
-│  │   - Standard VAE forward pass                                   │ │
-│  │   - Warp consistency loss in latent space                       │ │
-│  │   - Gradient accumulation if needed                              │ │
-│  └─────────────────────────────────────────────────────────────────┘ │
+│  WarpVAETrainer                                                      │
+│    - Encode source/target → latent_a, latent_b                       │
+│    - AE loss (recon + KL + LPIPS + discriminator)                    │
+│    - Warp consistency loss (with warmup ramp)                        │
+│    - Gradient accumulation (effective_bs = bs * accum_steps)         │
+│    - Dual optimizer step: AE + discriminator                         │
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -558,6 +513,8 @@ The precomputed warp pipeline separates the expensive RoMaV2 correspondence comp
 ### Precomputation Script
 
 **File:** `precompute_warps.py`
+
+Supports **single-GPU** and **multi-GPU** modes. Each worker loads its own RoMaV2 model on its assigned GPU and processes pairs in parallel via `multiprocessing.Pool`.
 
 ```bash
 python precompute_warps.py \
@@ -568,6 +525,7 @@ python precompute_warps.py \
     --max_pair_distance 20 \
     --num_pairs_per_sample 3 \
     --warp_resolution 256 \
+    --num_workers 2 --gpu_ids 0 1 \
     --resume  # Continue from existing files
 ```
 
@@ -578,22 +536,62 @@ python precompute_warps.py \
 | `--bb_file` | Path to CO3D bounding box .jgz file | Required |
 | `--output_dir` | Directory to save precomputed warps | Required |
 | `--root_dir` | CO3D dataset root directory | `/data/lab_moezkan/co3d_full` |
-| `--romav2_setting` | RoMaV2 model variant | `turbo` |
+| `--romav2_setting` | RoMaV2 model variant (`turbo`/`outdoor`/`indoor`) | `turbo` |
 | `--image_size` | Image size for warp computation | 256 |
 | `--warp_resolution` | Output warp field resolution | 256 |
 | `--max_pair_distance` | Maximum frame distance for pairs | 20 |
 | `--num_pairs_per_sample` | Number of pairs per sample | 3 |
 | `--resume` | Skip already computed warps | False |
+| `--num_workers` | Number of parallel GPU workers (1 = single GPU) | 1 |
+| `--gpu_ids` | GPU IDs to use (e.g., `0 1 2`) | Auto (first N GPUs) |
+
+**Multi-GPU Architecture:**
+
+```
+Single-Worker (--num_workers 1):       Multi-Worker (--num_workers 2):
+  Main Process (GPU 0)                   Main Process
+  ├─ Load RoMaV2                         ├─ Split pairs into N batches
+  └─ Process all pairs                   ├─ Worker 0 (GPU 0)
+                                         │  ├─ Load own RoMaV2
+                                         │  └─ Process batch 0
+                                         └─ Worker 1 (GPU 1)
+                                            ├─ Load own RoMaV2
+                                            └─ Process batch 1
+```
+
+**Expected Speedups:**
+
+| Workers | GPUs | Speedup | Memory per GPU |
+|---------|------|---------|----------------|
+| 1 | 1 | 1.0x | ~3-5GB |
+| 2 | 2 | 1.8-2.0x | ~3-5GB each |
+| 3 | 3 | 2.4-2.6x | ~3-5GB each |
+
+**Pair Generation Logic:**
+1. Each sample belongs to a CO3D sequence (object + viewpoint track)
+2. For each sample, `num_pairs_per_sample` targets are randomly selected within `max_pair_distance` frames
+3. Pairs stored as ordered tuples `(min_idx, max_idx)` to avoid duplicates
+4. With `--resume`, existing `.pt` files are detected and skipped
 
 **Output Structure:**
 
 ```
 output_dir/
-├── metadata.json           # Precomputation settings
+├── metadata.json           # Settings (bb_file, resolution, num_workers, gpu_ids, etc.)
 ├── warp_00000_00001.pt     # Warp data for pair (0, 1)
 ├── warp_00000_00005.pt     # Warp data for pair (0, 5)
 ├── warp_00001_00003.pt     # ...
 └── ...
+```
+
+Each `.pt` file contains:
+```python
+{
+    "warp_ab": Tensor[H, W, 2],       # Normalized grid coords A→B
+    "confidence_ab": Tensor[H, W],    # Match confidence A→B
+    "warp_ba": Tensor[H, W, 2],       # Normalized grid coords B→A
+    "confidence_ba": Tensor[H, W],    # Match confidence B→A
+}
 ```
 
 ### Dataset: `PrecomputedWarpDataset`
@@ -601,10 +599,11 @@ output_dir/
 **File:** `src/data/warp_dataset.py`
 
 The dataset automatically:
-1. Discovers available warp pairs from the output directory
-2. Loads and resizes warps to match training image size (with warning if mismatch)
-3. Applies confidence thresholding
-4. Returns the same format as `WarpCO3DDataset`
+1. Discovers available warp pairs from the output directory (supports both 5-digit `warp_00000_00001.pt` and 4-digit `warp_0000_0001.pt` naming)
+2. Loads warp resolution from `metadata.json` if available
+3. Resizes warps to match training `image_size` if resolution differs (logs a warning on first mismatch)
+4. Applies **soft confidence thresholding** (not hard cutoff)
+5. Returns the same format as `WarpCO3DDataset`
 
 **Key Parameters:**
 
@@ -614,28 +613,62 @@ The dataset automatically:
 | `bb_file` | Bounding box file | Required |
 | `warp_dir` | Directory with precomputed warps | Required |
 | `image_size` | Training image size | 256 |
-| `confidence_threshold` | Min confidence for valid matches | 0.1 |
+| `warp_resolution` | Auto-detected from `metadata.json` | `None` |
+| `confidence_threshold` | Soft confidence threshold | 0.1 |
+
+**Soft Confidence Thresholding:**
+
+Unlike a hard cutoff, the confidence threshold applies a soft ramp that suppresses low-confidence correspondences while preserving gradients:
+
+```python
+# Values below threshold become 0; values above are rescaled to [0, 1]
+confidence = clamp(confidence - threshold, min=0) / (1 - threshold)
+```
+
+For example, with `confidence_threshold=0.25`:
+- Confidence 0.1 → 0.0 (suppressed)
+- Confidence 0.25 → 0.0 (boundary)
+- Confidence 0.5 → 0.33
+- Confidence 1.0 → 1.0
 
 ### Configuration
 
 **File:** `config/warp_vae_co3d_precomputed.yaml`
 
-Key differences from online training:
+Key differences from online training config:
 
 ```yaml
+model:
+  params:
+    lossconfig:
+      params:
+        disc_start: 15000              # Discriminator activates at step 15k
+        kl_weight: 1e-05               # Increased KL for better latent regularization
+
+trainer:
+  params:
+    warp_consistency_weight: 1.0
+    loss_confidence_threshold: 0.2
+    warmup_steps: 5000                 # 5k steps to ramp up warp loss
+    vanilla_probability: 0             # Always use warp loss
+    gradient_accumulation_steps: 4     # Effective batch = batch_size * 4
+
 data:
   params:
     dataset_config:
-      type: precomputed_warp        # Uses PrecomputedWarpDataset
+      type: precomputed_warp           # Uses PrecomputedWarpDataset (no RoMaV2!)
       params:
-        warp_dir: "/path/to/precomputed_warps"
-    num_workers: 4                  # Can use workers now!
-    pin_memory: true                # Enable for faster transfers
-    persistent_workers: true        # Keep workers alive
+        warp_dir: "/data/lab_moezkan/precomputed_warps/toybus"
+        confidence_threshold: 0.25     # Soft threshold for correspondences
+    num_workers: 4                     # Parallel data loading (no CUDA in dataloader)
+    pin_memory: true
+    persistent_workers: true
 
 training:
-  batch_size: 4                     # Larger batches possible
-  gradient_accumulation_steps: 4    # Can reduce (larger effective batch)
+  batch_size: 2                        # Can increase (no RoMaV2 memory overhead)
+  lr: 1e-5                             # Increased from 1e-6 for faster convergence
+  precision: 32                        # FP32 (avoids FP16 stability issues)
+  gradient_accumulation_steps: 4       # Effective batch size = 2 * 4 = 8
 ```
 
 ### Performance Comparison
@@ -661,9 +694,10 @@ training:
 |--------|-----|---------|------------|--------------|------------|-------------|--------|
 | `warp_vae_co3d_small` | 64 | [1,2,4] | 4 | 8× | 128×128 | 16×16×4 | ~21M |
 | `warp_vae_co3d` | 128 | [1,2,4,4] | 4 | 8× | 256×256 | 32×32×4 | ~84M |
+| `warp_vae_co3d_precomputed` | 128 | [1,2,4,4] | 4 | 8× | 256×256 | 32×32×4 | ~84M |
 | SD-VAE 2.1 (reference) | 128 | [1,2,4,4] | 4 | 8× | 768×768 | 96×96×4 | ~84M |
 
-**Note:** The `warp_vae_co3d` config matches the SD-VAE 2.1 architecture exactly, just trained at 256×256 resolution for memory constraints.
+**Note:** `warp_vae_co3d_precomputed` and `warp_vae_co3d` share the same model architecture (matching SD-VAE 2.1), differing only in the data pipeline (precomputed vs online warps) and training hyperparameters.
 
 ## Expected Results
 
@@ -671,11 +705,13 @@ training:
 
 | Metric | Description | Expected Trend |
 |--------|-------------|----------------|
-| `train/aeloss` | Total AE loss | Decrease |
-| `train/warp_loss` | Warp consistency | Decrease |
-| `train/rec_loss` | Reconstruction L1 | Decrease |
-| `train/kl_loss` | KL divergence | Stable/slight increase |
-| `train/discloss` | Discriminator | Activate at step 50001 |
+| `train/aeloss` | Standard AE loss (recon + KL + perceptual) | Decrease |
+| `train/warp_loss` | Warp consistency loss (weighted) | Decrease |
+| `train/total_ae_loss` | aeloss + warp_loss | Decrease |
+| `train/warp_consistency_loss` | Raw consistency (unweighted) | Decrease |
+| `train/warp_factor` | Warmup multiplier (0→1) | Ramp to 1.0 over warmup_steps |
+| `train/discloss` | Discriminator | Activate at `disc_start` (15000) |
+| `train/vanilla_mode` | Warp loss skipped (0/1) | Depends on `vanilla_probability` |
 
 ### Baseline vs Trained
 
@@ -689,12 +725,10 @@ training:
 
 | File | Purpose |
 |------|---------|
-| `src/data/warp_dataset.py` | WarpCO3DDataset (online) and PrecomputedWarpDataset |
-| `src/losses/warp_consistency.py` | Warp consistency loss functions |
-| `src/trainer/vae_trainers.py` | WarpVAETrainer class |
-| `precompute_warps.py` | Script to precompute RoMaV2 warps |
-| `config/warp_vae_co3d_small.yaml` | Small model config (ch=64, 128×128) |
+| `src/data/warp_dataset.py` | `WarpCO3DDataset` (online) and `PrecomputedWarpDataset` |
+| `src/losses/warp_consistency.py` | `WarpConsistencyLoss`, `WarpReconstructionLoss`, `CycleConsistencyLoss` |
+| `src/trainer/vae_trainers.py` | `WarpVAETrainer` class with gradient accumulation |
+| `precompute_warps.py` | Multi-GPU script to precompute RoMaV2 warps |
+| `config/warp_vae_co3d_small.yaml` | Small model config (ch=64, 128×128, online warps) |
 | `config/warp_vae_co3d.yaml` | Full SD-VAE config (ch=128, 256×256, online warps) |
-| `config/warp_vae_co3d_precomputed.yaml` | Precomputed warps config (recommended) |
-| `eval_warp_vae.py` | Evaluation and visualization |
-| `compare_latents.py` | Compare latent representations across models |
+| `config/warp_vae_co3d_precomputed.yaml` | Precomputed warps config (recommended for production) |

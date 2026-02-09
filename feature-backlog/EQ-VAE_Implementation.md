@@ -420,18 +420,6 @@ python train.py --config-name=eqvae_omniobject \
 
 ---
 
-## Future Improvements
-
-See [eqvae-future-features.md](feature-backlog/(2)eqvae-future-features.md) for planned enhancements:
-
-1. **Real Camera Transformations** - Use actual camera poses from OmniObject instead of synthetic 2D transforms
-2. **Prior Preservation Mode** - Additional `p_prior_s` for random downscaling only
-3. **Anisotropic Scaling** - Different scale factors for x and y
-4. **Arbitrary Angle Rotations** - Continuous rotation angles
-5. **Learning Rate Scheduling** - Cosine annealing for better convergence
-
----
-
 ## Summary
 
 EQ-VAE improves upon standard VAE training by:
