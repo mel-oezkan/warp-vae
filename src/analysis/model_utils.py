@@ -106,8 +106,9 @@ def load_model(checkpoint_path: str, config_path: str, model_type: str = "auto")
             ddconfig=OmegaConf.to_container(model_params.ddconfig),
             lossconfig=OmegaConf.to_container(model_params.lossconfig),
             embed_dim=model_params.embed_dim,
-            p_prior=model_params.get("p_prior", 0.9),
-            scale_range=model_params.get("scale_range", [0.25, 1.0]),
+            p_prior=model_params.get("p_prior", 0.5),
+            p_prior_s=model_params.get("p_prior_s", 0.25),
+            anisotropic=model_params.get("anisotropic", False),
             use_rotation=model_params.get("use_rotation", True),
         )
 
