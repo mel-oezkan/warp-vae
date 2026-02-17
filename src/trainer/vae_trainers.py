@@ -203,13 +203,15 @@ class PluckerVAETrainer(BaseVAETrainer):
 class EQVAETrainer(BaseVAETrainer):
     """
     Trainer for EQVAEAutoencoder (Equivariant VAE).
-    
-    Extends base training with:
-    - Probabilistic equivariance regularization
-    - Latent-space transformations (scaling, rotation)
-    - Transformed target generation
+
+    Matches the reference zelaki/eqvae implementation:
+    - EQ-VAE path (p_prior): scale + rotate latent AND ground truth, output dims change
+    - Prior preservation path (1 - p_prior): low-res (p_prior_s) or full-res standard VAE
+    - Discrete scale sampling from {8/32, ..., 31/32}
+    - Rotation k ∈ {1, 2, 3} (never identity)
+    - Optional anisotropic scaling
     """
-    
+
     def __init__(
         self,
         model_config: Dict[str, Any],
@@ -220,12 +222,14 @@ class EQVAETrainer(BaseVAETrainer):
         checkpoint_path: Optional[str] = None,
         ignore_keys: List[str] = [],
         # EQ-VAE specific
-        p_prior: float = 0.9,
+        p_prior: float = 0.5,
+        p_prior_s: float = 0.25,
+        anisotropic: bool = False,
         equivariance_weight: float = 1.0,
     ):
         """
         Initialize EQ-VAE trainer.
-        
+
         Args:
             model_config: Config for EQVAEAutoencoder instantiation
             learning_rate: Learning rate for optimizers
@@ -235,8 +239,13 @@ class EQVAETrainer(BaseVAETrainer):
             checkpoint_path: Path to pretrained checkpoint
             ignore_keys: Keys to ignore when loading checkpoint
             p_prior: Probability of applying equivariance regularization
+            p_prior_s: Probability of low-res prior preservation (when not EQ-VAE)
+            anisotropic: Allow independent x/y scaling
             equivariance_weight: Weight for equivariance loss
         """
+        import random as _random
+        self._random = _random
+
         super().__init__(
             model_config=model_config,
             learning_rate=learning_rate,
@@ -246,68 +255,83 @@ class EQVAETrainer(BaseVAETrainer):
             checkpoint_path=checkpoint_path,
             ignore_keys=ignore_keys,
         )
-        
+
         self.p_prior = p_prior
+        self.p_prior_s = p_prior_s
+        self.anisotropic = anisotropic
         self.equivariance_weight = equivariance_weight
-        
-        # Track whether current step uses equivariance
-        self._use_eqvae_this_step = False
+
+        # Discrete scale choices: {8/32, ..., 31/32}
+        self._scale_choices = [s / 32 for s in range(8, 32)]
+
+        # Track current step state for logging
         self._current_transformed_target = None
-        
-        print(f"[EQVAETrainer] Initialized with p_prior={p_prior}, eq_weight={equivariance_weight}")
-    
+
+        print(f"[EQVAETrainer] Initialized with p_prior={p_prior}, p_prior_s={p_prior_s}, "
+              f"anisotropic={anisotropic}, eq_weight={equivariance_weight}")
+
     def _get_model_output(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Any]:
         """
-        Get model output, potentially with equivariance transforms.
-        
-        Randomly decides whether to apply EQ-VAE transformations based on p_prior.
-        
+        Get model output for validation (standard forward, no transforms).
+
         Returns:
             Tuple of (reconstructions, posterior)
         """
         inputs = self.get_input(batch, self.image_key)
-        
-        # Decide whether to apply equivariance
-        self._use_eqvae_this_step = torch.rand(1).item() < self.p_prior
-        
-        if self._use_eqvae_this_step and self.training:
-            # Use EQ-VAE forward with transformations
-            reconstructions, posterior, transformed_target = self.model._eqvae_forward(inputs)
-            self._current_transformed_target = transformed_target
-        else:
-            # Standard forward pass
-            reconstructions, posterior = self.model(inputs, sample_posterior=True)
-            self._current_transformed_target = None
-        
+        reconstructions, posterior, _ = self.model(inputs)
+        self._current_transformed_target = None
         return reconstructions, posterior
-    
+
     def training_step(self, batch: Dict[str, Any], batch_idx: int):
         """
-        Training step with equivariance-aware loss computation.
+        Training step matching the reference zelaki/eqvae implementation.
 
-        When EQ-VAE is active, the reconstruction target is the transformed input,
-        not the original input.
+        With probability p_prior: EQ-VAE path (scale + rotate latent and GT).
+        Otherwise: prior preservation (low-res with p_prior_s, or full-res).
 
         Uses manual optimization for dual optimizer setup.
         """
         opt_ae, opt_disc = self.optimizers()
 
         inputs = self.get_input(batch, self.image_key)
-        model_output = self._get_model_output(batch)
 
-        reconstructions = model_output[0]
-        posterior = model_output[1]
+        # EQ-VAE regularization
+        if self._random.random() < self.p_prior:
+            mode = "latent"
+            if self.anisotropic:
+                scale_x = self._random.choice(self._scale_choices)
+                scale_y = self._random.choice(self._scale_choices)
+                scale = (scale_x, scale_y)
+            else:
+                scale = self._random.choice(self._scale_choices)
 
-        # Determine target for reconstruction loss
-        if self._use_eqvae_this_step and self._current_transformed_target is not None:
-            target = self._current_transformed_target
+            # Rotation: k ∈ {1, 2, 3} (never identity)
+            angle = self._random.choice([1, 2, 3])
+            reconstructions, posterior, _ = self.model(inputs, scale=scale, angle=angle)
+
+            # Apply same transforms to ground truth
+            target = F.interpolate(inputs, scale_factor=scale, mode='bilinear', align_corners=False)
+            target = torch.rot90(target, k=angle, dims=[-1, -2])
+            self._current_transformed_target = target
+
+        # Prior preservation
         else:
+            mode = "image"
+            if self._random.random() < self.p_prior_s:
+                # Low-resolution prior preservation
+                scale = self._random.choice(self._scale_choices)
+                inputs = F.interpolate(inputs, scale_factor=scale, mode='bilinear', align_corners=False)
+                reconstructions, posterior, _ = self.model(inputs)
+            else:
+                # Full-resolution standard forward
+                scale = 1
+                reconstructions, posterior, _ = self.model(inputs)
             target = inputs
+            self._current_transformed_target = None
 
         # ========== Optimize Autoencoder ==========
-        # Autoencoder loss (against appropriate target)
         aeloss, log_dict_ae = self.model.loss(
-            target,  # Use transformed target if EQ-VAE active
+            target,
             reconstructions,
             posterior,
             0,  # optimizer_idx for autoencoder
@@ -316,18 +340,15 @@ class EQVAETrainer(BaseVAETrainer):
             split="train",
         )
 
-        # Optimize autoencoder
         opt_ae.zero_grad()
         self.manual_backward(aeloss)
         opt_ae.step()
 
-        # Log EQ-VAE status
-        self.log("train/eqvae_active", float(self._use_eqvae_this_step), sync_dist=False)
-        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        self.log(f"train/aeloss_scale-{scale}-{mode}", aeloss,
+                 prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
 
         # ========== Optimize Discriminator ==========
-        # Discriminator loss
         discloss, log_dict_disc = self.model.loss(
             target,
             reconstructions,
@@ -338,17 +359,16 @@ class EQVAETrainer(BaseVAETrainer):
             split="train",
         )
 
-        # Optimize discriminator
         opt_disc.zero_grad()
         self.manual_backward(discloss)
         opt_disc.step()
 
-        # Log discriminator losses
-        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        self.log(f"train/discloss_scale-{scale}-{mode}", discloss,
+                 prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
         self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
 
         return aeloss
-    
+
     def _validation_step(
         self,
         batch: Dict[str, Any],
@@ -358,12 +378,9 @@ class EQVAETrainer(BaseVAETrainer):
         """
         Validation step - always uses standard forward (no transforms).
         """
-        # Disable EQ-VAE transforms during validation
-        self._use_eqvae_this_step = False
         self._current_transformed_target = None
-        
         return super()._validation_step(batch, batch_idx, postfix)
-    
+
     def _get_additional_log_images(
         self,
         batch: Dict[str, Any],
