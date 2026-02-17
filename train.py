@@ -228,14 +228,27 @@ def main(cfg: DictConfig):
         trainer_module.model.load_state_dict(vae_weights, strict=False)
         print(f"[INFO] Loaded {len(vae_weights)} pretrained parameters")
 
-    # Create checkpoint callback
-    checkpoint_cb = ModelCheckpoint(
-        dirpath=f"checkpoints/{run_name}",
-        filename="vae-epoch{epoch:03d}",
-        save_top_k=-1,
-        every_n_epochs=cfg.training.get("checkpoint_every_n_epochs", 5),
-        save_last=True,
-    )
+    # Create checkpoint callbacks
+    checkpoint_callbacks = []
+    checkpoint_dir = f"checkpoints/{run_name}"
+
+    every_n_steps = cfg.training.get("checkpoint_every_n_steps", 0)
+    if every_n_steps > 0:
+        checkpoint_callbacks.append(ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename="vae-step{step:06d}",
+            save_top_k=-1,
+            every_n_train_steps=every_n_steps,
+            save_last=True,
+        ))
+    else:
+        checkpoint_callbacks.append(ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename="vae-epoch{epoch:03d}",
+            save_top_k=-1,
+            every_n_epochs=cfg.training.get("checkpoint_every_n_epochs", 5),
+            save_last=True,
+        ))
 
     # Create PyTorch Lightning Trainer
     # Note: accumulate_grad_batches is NOT used here because we use manual optimization
@@ -250,12 +263,15 @@ def main(cfg: DictConfig):
         logger=wandb_logger if use_wandb else None,
         log_every_n_steps=cfg.training.get("log_every_n_steps", 50),
         check_val_every_n_epoch=cfg.training.get("check_val_every_n_epoch", 1),
-        callbacks=[checkpoint_cb],
+        callbacks=checkpoint_callbacks,
     )
 
-    # Train
+    # Train (optionally resume from checkpoint)
+    resume_ckpt = cfg.training.get("resume_from_checkpoint", None)
+    if resume_ckpt:
+        print(f"[INFO] Resuming from checkpoint: {resume_ckpt}")
     print(f"[INFO] Starting training for {cfg.training.num_epochs} epochs")
-    pl_trainer.fit(trainer_module, datamodule=data_module)
+    pl_trainer.fit(trainer_module, datamodule=data_module, ckpt_path=resume_ckpt)
 
     # Save final model
     final_model_path = f"{log_dir}/last_model.pth"
