@@ -203,15 +203,6 @@ Automatically detected via `CUDA_VISIBLE_DEVICES`:
 CUDA_VISIBLE_DEVICES=0,1,2,3 python train.py --config-name=plucker_vae_co3d
 ```
 
-### Mixed Precision (FP16)
-
-Already enabled by default (`precision: 16`):
-
-```bash
-python train.py --config-name=vanilla_vae_co3d \
-    training.precision=32  # Use FP32 if needed
-```
-
 ---
 
 ## Resuming Training
@@ -374,15 +365,8 @@ Approximate GPU Memory = Base Model + (Batch Size × Image Memory)
 
 ---
 
-## Support
+## Further Reading
 
-- **Implementation Details**: See [MIGRATION_COMPLETE.md](MIGRATION_COMPLETE.md)
-- **Detailed Plan**: See [feature-backlog/(4)modular-migration.md](feature-backlog/(4)modular-migration.md)
-- **Future Features**: See [feature-backlog/(2)eqvae-future-features.md](feature-backlog/(2)eqvae-future-features.md)
-- **Issues**: Check console warnings and error messages
-- **GPU Memory Problems**: See "GPU Memory Guide" section above
-- **Evaluation Results**: See [evaluation_outputs/](evaluation_outputs/)
-
----
-
-**Happy Training! 🚀**
+- **Model Variants**: See [EQ-VAE_Implementation.md](EQ-VAE_Implementation.md), [Warp_VAE_Training.md](Warp_VAE_Training.md), [PluckerVAE_Variants.md](PluckerVAE_Variants.md)
+- **Evaluation**: See [MultiViewConsistencyEval.md](MultiViewConsistencyEval.md)
+- **Documentation Index**: See [README.md](README.md)
