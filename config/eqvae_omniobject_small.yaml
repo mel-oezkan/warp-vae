@@ -11,7 +11,8 @@ model:
 
     # EQ-VAE specific parameters
     p_prior: 0.5
-    scale_range: [0.25, 1.0]
+    p_prior_s: 0.25
+    anisotropic: false
     use_rotation: true
     equivariance_weight: 1.0
 

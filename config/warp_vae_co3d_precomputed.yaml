@@ -43,7 +43,7 @@ model:
     lossconfig:
       target: ldm.modules.losses.LPIPSWithDiscriminator
       params:
-        disc_start: 10000
+        disc_start: 15000
         kl_weight: ${training.kl_weight}
         disc_weight: 0.5
         perceptual_weight: ${training.lpips_loss_weight}
@@ -60,8 +60,8 @@ trainer:
     consistency_loss_type: "l1"
     bidirectional: true
     confidence_weighted: true
-    loss_confidence_threshold: 0.1
-    warmup_steps: 1000
+    loss_confidence_threshold: 0.2
+    warmup_steps: 5000
     vanilla_probability: 0
     gradient_accumulation_steps: ${training.gradient_accumulation_steps}
 
@@ -88,9 +88,9 @@ training:
   image_size: 256
   num_workers: 4                            # Can use workers now! No CUDA in dataloader
   val_split: 0.2
-  num_epochs: 8
-  lr: 1e-4                                  # Increased from 1e-6 for faster convergence
-  kl_weight: 1e-04                          # Increased from 1e-6 for better latent regularization
+  num_epochs: 20
+  lr: 1e-5                                  # Increased from 1e-6 for faster convergence
+  kl_weight: 1e-05                          # Increased from 1e-6 for better latent regularization
   lpips_loss_weight: 1.0
   ema_decay: 0.9999
   precision: 32
