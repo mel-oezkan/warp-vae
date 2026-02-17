@@ -49,19 +49,23 @@
 #     --n_detailed_objects 5
 
 python scripts/analyze_multiview_latent_consistency.py \
+    --dataset co3d \
     --checkpoints \
-        checkpoints/massive-accurate-okapi-of-blizzard/last.ckpt \
+        checkpoints/statuesque-super-cuckoo-of-anger/last.ckpt \
         checkpoints/eq-vae/diffusion_pytorch_model.safetensors \
         weights/f8/model.ckpt \
     --configs \
         config/warp_vae_co3d_precomputed.yaml \
-        config/checkpoints/eq-vae/config.json \
+        checkpoints/eq-vae/config.json \
         config/baseVAE.yaml \
     --model_names "WARP-VAE" "EQ-VAE" "SD-VAE" \
     --mode roma \
     --roma_setting fast \
-    --max_angle 90 \
-    --output_name full_comparison90
+    --roma_confidence_threshold 0.2 \
+    --max_distance 3.0 \
+    --min_distance 0.5 \
+    --precomputed_warps_dir /visinf/projects_students/dlcv2025_groupZ/precomputed_warps/hydrant \
+    --output_name full_comparison_co3d
 
 # # RoMA mode only
 # python scripts/analyze_multiview_latent_consistency.py \
