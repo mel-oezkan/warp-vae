@@ -7,6 +7,11 @@ First, you should pre-compute the bounding boxes since this takes a long time.
 
 Usage:
     python preprocess_co3d.py --category all --precompute_bbox --co3d_v2_dir ../data/co3d_data
+
+python preprocess_co3d.py \
+    --category hydrant \
+    --co3d_v2_dir /visinf/projects_students/dlcv2025_groupZ/co3d_full \
+    --output_dir /visinf/projects_students/dlcv2025_groupZ/co3d_annotations
 """
 
 import argparse
