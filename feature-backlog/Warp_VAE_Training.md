@@ -62,7 +62,89 @@ def _compute_warp(self, img_a, img_b):
     confidence_ab = pred_ab["overlap_AB"]  # Shape: [1, H, W, 1]
 ```
 
-### 2. Loss Functions: `WarpConsistencyLoss`
+### 2. Loss Functions
+
+#### 2a. AE Loss: `LPIPSWithDiscriminator`
+
+**File:** `ldm/modules/losses/contperceptual.py`
+
+The main autoencoder loss combining reconstruction, perceptual, KL regularization, and adversarial objectives.
+
+**Total loss formula (generator/encoder-decoder optimizer):**
+
+```
+L_AE = L_rec + kl_weight * L_KL + d_weight * disc_factor * L_G
+
+where:
+  L_rec = L_L1 + perceptual_weight * L_LPIPS
+  L_L1  = mean(|inputs - reconstructions|)           # pixel-wise L1
+  L_KL  = KL(posterior || N(0,1))                    # latent regularization
+  L_G   = -mean(discriminator(reconstructions))      # generator adversarial loss
+  d_weight = ||∇_L_rec|| / (||∇_L_G|| + 1e-4)       # adaptive balancing weight
+  disc_factor = 0 until disc_start steps, then 1     # discriminator warmup
+```
+
+The reconstruction loss is further weighted by a learned log-variance `logvar` (NLL formulation):
+
+```python
+nll_loss = rec_loss / exp(logvar) + logvar   # learnable uncertainty weighting
+loss = sum(nll_loss) + kl_weight * kl_loss + d_weight * disc_factor * g_loss
+```
+
+**Discriminator loss (separate optimizer):**
+
+```
+L_disc = disc_factor * L_hinge(logits_real, logits_fake) + disc_factor * (r1_weight/2) * R1 * r1_every
+
+Hinge loss:  0.5 * (mean(relu(1 - logits_real)) + mean(relu(1 + logits_fake)))
+Vanilla GAN: 0.5 * (mean(softplus(-logits_real)) + mean(softplus(logits_fake)))
+R1 penalty:  mean(||∇_x D(x_real)||^2)  — penalizes large discriminator gradients on real data
+```
+
+**R1 Gradient Penalty:**
+
+The R1 penalty (from "Which Training Methods for GANs do actually Converge?", Mescheder et al. 2018) prevents discriminator logits from growing unboundedly, which is critical for stable training with hinge loss + gradient accumulation. Without R1:
+
+1. Hinge discriminator loss saturates to 0 once logits pass margin of 1
+2. Discriminator stops receiving gradients, but its logits keep growing
+3. `g_loss = -mean(logits_fake)` becomes very negative (observed: -168)
+4. Adaptive weight `d_weight` hits clamp ceiling (5000)
+5. `d_weight * g_loss = 5000 * (-168) = -840,000` overwhelms `nll_loss ≈ 70,000`
+6. **Result: ae_loss goes negative** (observed: -773,000 in run `overjoyed-melodic-swine-of-economy`)
+
+The R1 penalty uses **lazy regularization** (only applied every `disc_r1_every` steps) to reduce computational overhead, with the weight scaled by `disc_r1_every` to maintain the correct effective penalty.
+
+**Key hyperparameters:**
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `disc_start` | Step at which discriminator activates | 50001 (small), 15000 (precomputed) |
+| `kl_weight` | KL divergence regularization weight | 1e-6 (small), 1e-5 (precomputed) |
+| `perceptual_weight` | LPIPS loss weight | 1.0 |
+| `disc_weight` | Adaptive discriminator weight cap | 0.5 |
+| `disc_factor` | Base discriminator scaling factor | 1.0 |
+| `disc_loss` | GAN loss type | `"hinge"` or `"vanilla"` |
+| `disc_r1_weight` | R1 gradient penalty weight | 10.0 |
+| `disc_r1_every` | Apply R1 every N steps (lazy reg) | 16 |
+
+#### 2b. Perceptual Loss: `LPIPS`
+
+**File:** `taming/modules/losses/lpips.py`
+
+Measures perceptual similarity using deep features from a frozen VGG16 backbone.
+
+```
+L_LPIPS = Σ(k=0..4) spatial_avg( conv1x1_k( (normalize(feat_k_input) - normalize(feat_k_recon))^2 ) )
+```
+
+- **Backbone:** Pre-trained VGG16 (frozen, `requires_grad=False`)
+- **Feature levels:** 5 layers — `relu1_2`, `relu2_2`, `relu3_3`, `relu4_3`, `relu5_3`
+- **Channel dims:** `[64, 128, 256, 512, 512]`
+- Features are L2-normalized before computing squared differences
+- Per-level learned `1×1` conv layers weight the contribution of each feature level
+- Results are spatially averaged and summed across all 5 levels
+
+#### 2c. Warp Consistency Loss: `WarpConsistencyLoss`
 
 **File:** `src/losses/warp_consistency.py`
 
@@ -96,10 +178,13 @@ class WarpConsistencyLoss(nn.Module):
         return loss
 ```
 
-**Loss Types Available:**
-- `WarpConsistencyLoss`: Enforces latent consistency across views
-- `WarpReconstructionLoss`: Reconstructs warped image (not used by default)
-- `CycleConsistencyLoss`: Enforces A→B→A cycle consistency
+**Warp loss types available:**
+
+| Type | Description | Used by default |
+|------|-------------|-----------------|
+| `WarpConsistencyLoss` | Enforces latent consistency across views | Yes |
+| `WarpReconstructionLoss` | Compares warped reconstruction to target image (pixel + optional LPIPS) | No (`warp_reconstruction_weight: 0.0`) |
+| `CycleConsistencyLoss` | Validates warp quality via A→B→A cycle error | No |
 
 ### 3. Trainer: `WarpVAETrainer`
 
