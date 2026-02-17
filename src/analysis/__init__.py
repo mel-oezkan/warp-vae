@@ -19,8 +19,11 @@ from .camera_utils import (
     load_camera_data,
     extract_camera_positions,
     compute_angular_separation,
+    compute_euclidean_distance_matrix,
     find_overlapping_pairs,
     find_view_sequences,
+    load_co3d_annotations,
+    extract_co3d_camera_positions,
 )
 
 from .visualization import (
@@ -56,8 +59,11 @@ __all__ = [
     "load_camera_data",
     "extract_camera_positions",
     "compute_angular_separation",
+    "compute_euclidean_distance_matrix",
     "find_overlapping_pairs",
     "find_view_sequences",
+    "load_co3d_annotations",
+    "extract_co3d_camera_positions",
     # Visualization
     "latent_to_pca_rgb",
     "visualize_reconstructions",
