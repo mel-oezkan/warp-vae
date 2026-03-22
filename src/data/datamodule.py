@@ -49,6 +49,7 @@ class VAEDataModule(pl.LightningDataModule):
         shuffle_val: bool = False,
         drop_last: bool = True,
         persistent_workers: bool = True,
+        prefetch_factor: Optional[int] = None,
         seed: int = 42,
         # Optional: separate configs for train/val/test
         train_dataset_config: Optional[Dict[str, Any]] = None,
@@ -91,6 +92,8 @@ class VAEDataModule(pl.LightningDataModule):
         self.shuffle_val = shuffle_val
         self.drop_last = drop_last
         self.persistent_workers = persistent_workers and num_workers > 0
+        # prefetch_factor requires num_workers > 0; ignore otherwise
+        self.prefetch_factor = prefetch_factor if num_workers > 0 else None
         self.seed = seed
         
         # Optional separate dataset configs
@@ -185,6 +188,9 @@ class VAEDataModule(pl.LightningDataModule):
     
     def train_dataloader(self) -> DataLoader:
         """Get training dataloader."""
+        kwargs = {}
+        if self.prefetch_factor is not None:
+            kwargs["prefetch_factor"] = self.prefetch_factor
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
@@ -193,6 +199,7 @@ class VAEDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             drop_last=self.drop_last,
             persistent_workers=self.persistent_workers,
+            **kwargs,
         )
     
     def val_dataloader(self) -> DataLoader:
