@@ -21,6 +21,7 @@ from src.dataset.co3d import Co3DDataModule
 torch.cuda.empty_cache()
 
 
+
 def get_vae_weights(input_path):
     pretrained_weights = torch.load(input_path, weights_only=False)
     if "state_dict" in pretrained_weights:
@@ -228,8 +229,9 @@ def main(cfg: DictConfig):
         trainer_module.model.load_state_dict(vae_weights, strict=False)
         print(f"[INFO] Loaded {len(vae_weights)} pretrained parameters")
 
-    # Create checkpoint callbacks
+    # Create callbacks
     checkpoint_callbacks = []
+
     checkpoint_dir = f"checkpoints/{run_name}"
 
     every_n_steps = cfg.training.get("checkpoint_every_n_steps", 0)
@@ -263,6 +265,7 @@ def main(cfg: DictConfig):
         logger=wandb_logger if use_wandb else None,
         log_every_n_steps=cfg.training.get("log_every_n_steps", 50),
         check_val_every_n_epoch=cfg.training.get("check_val_every_n_epoch", 1),
+        limit_train_batches=cfg.training.get("limit_train_batches", 1.0),
         callbacks=checkpoint_callbacks,
     )
 
