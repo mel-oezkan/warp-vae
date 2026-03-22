@@ -39,6 +39,9 @@ Usage:
 """
 
 import argparse
+import gzip
+import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 import sys
@@ -216,6 +219,82 @@ class CO3DAdapter(DatasetAdapter):
         return img
 
 
+class NativeCO3DAdapter(DatasetAdapter):
+    """Adapter for native CO3D dataset (frame_annotations.jgz across all categories)."""
+
+    def __init__(self, co3d_root: str, num_objects: int, seed: int):
+        self.co3d_root = Path(co3d_root)
+        self.sequences = {}  # (category, seq_name) -> list of frame dicts
+
+        # Scan all category directories
+        for cat_dir in sorted(self.co3d_root.iterdir()):
+            if not cat_dir.is_dir():
+                continue
+            ann_path = cat_dir / "frame_annotations.jgz"
+            if not ann_path.exists():
+                continue
+
+            with gzip.open(str(ann_path), "rt") as f:
+                frames = json.load(f)
+
+            # Group frames by sequence
+            by_seq = defaultdict(list)
+            for fr in frames:
+                by_seq[fr["sequence_name"]].append(fr)
+
+            for seq_name, seq_frames in by_seq.items():
+                # Sort by frame number for consistent ordering
+                seq_frames.sort(key=lambda x: x["frame_number"])
+                # Only include sequences whose image directory exists
+                seq_dir = cat_dir / seq_name
+                if seq_dir.is_dir():
+                    self.sequences[(cat_dir.name, seq_name)] = seq_frames
+
+        # Sample sequences
+        all_keys = sorted(self.sequences.keys())
+        np.random.seed(seed)
+        if len(all_keys) > num_objects:
+            np.random.shuffle(all_keys)
+            all_keys = all_keys[:num_objects]
+        self.selected_keys = all_keys
+        print(f"NativeCO3DAdapter: {len(self.sequences)} total sequences, selected {len(self.selected_keys)}")
+
+    def get_object_ids(self):
+        return self.selected_keys
+
+    def get_object_name(self, obj_id):
+        category, seq_name = obj_id
+        return f"{category}/{seq_name}"
+
+    def get_camera_positions(self, obj_id):
+        frames = self.sequences[obj_id]
+        positions = []
+        for fr in frames:
+            vp = fr["viewpoint"]
+            R = np.array(vp["R"])
+            T = np.array(vp["T"])
+            cam_pos = -R.T @ T
+            positions.append(cam_pos)
+        return np.array(positions)
+
+    def get_num_views(self, obj_id):
+        return len(self.sequences[obj_id])
+
+    def load_view_image(self, obj_id, view_idx, transform, device):
+        frames = self.sequences[obj_id]
+        img_path = self.co3d_root / frames[view_idx]["image"]["path"]
+        img = Image.open(img_path).convert("RGB")
+        return transform(img).unsqueeze(0).to(device)
+
+    def load_view_image_pil(self, obj_id, view_idx, size=256):
+        frames = self.sequences[obj_id]
+        img_path = self.co3d_root / frames[view_idx]["image"]["path"]
+        img = Image.open(img_path).convert("RGB")
+        if size is not None:
+            img = img.resize((size, size), Image.LANCZOS)
+        return img
+
+
 def load_f8_baseline_vae(device="cuda"):
     """Load the f8 SD-VAE baseline model."""
     print(f"Loading f8 baseline VAE from {F8_BASELINE_CHECKPOINT}")
@@ -240,6 +319,14 @@ def _create_adapter_from_config(dataset_config: Dict, object_ids: list) -> Datas
             seed=0,
         )
         adapter.seq_names = object_ids
+        return adapter
+    elif dataset_config['type'] == 'co3d_native':
+        adapter = NativeCO3DAdapter(
+            co3d_root=dataset_config['co3d_native_dir'],
+            num_objects=999999,
+            seed=0,
+        )
+        adapter.selected_keys = object_ids
         return adapter
     else:
         adapter = OmniObjectAdapter.__new__(OmniObjectAdapter)
@@ -1576,8 +1663,14 @@ def parse_args():
     # Dataset selection
     parser.add_argument(
         "--dataset", type=str, default="omniobject",
-        choices=["omniobject", "co3d"],
+        choices=["omniobject", "co3d", "co3d_native"],
         help="Dataset type to use"
+    )
+    parser.add_argument(
+        "--co3d_native_dir", type=str,
+        default="/visinf/home/lab_mozkan/computer-vision-proj-lab/data/co3d_data",
+        help="Root directory of native CO3D data with per-category frame_annotations.jgz "
+             "(only used with --dataset co3d_native)"
     )
     parser.add_argument(
         "--co3d_dir", type=str,
@@ -1714,6 +1807,12 @@ def main():
         adapter = CO3DAdapter(
             co3d_dir=args.co3d_dir,
             annotations_path=args.co3d_annotations,
+            num_objects=args.num_objects,
+            seed=args.seed,
+        )
+    elif args.dataset == "co3d_native":
+        adapter = NativeCO3DAdapter(
+            co3d_root=args.co3d_native_dir,
             num_objects=args.num_objects,
             seed=args.seed,
         )
@@ -1856,6 +1955,7 @@ def main():
                 'data_dir': args.data_dir,
                 'co3d_dir': args.co3d_dir,
                 'co3d_annotations': args.co3d_annotations,
+                'co3d_native_dir': args.co3d_native_dir,
             }
 
             # Launch worker processes
