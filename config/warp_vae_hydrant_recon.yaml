@@ -1,10 +1,10 @@
 # WARP-VAE training on CO3D hydrant with precomputed warps
-# GPU 1: Warp consistency + WarpReconstructionLoss
+# From scratch with warp consistency + WarpReconstructionLoss enabled
 #
-# Run: CUDA_VISIBLE_DEVICES=1 python train.py --config-name=warp_vae_hydrant_recon
+# Run: CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_hydrant_recon
 
 model:
-  base_learning_rate: 4.5e-6
+  base_learning_rate: 1.0e-5
   target: ldm.models.autoencoder.AutoencoderKL
   params:
     embed_dim: 4
@@ -33,8 +33,6 @@ model:
         disc_in_channels: 3
         disc_num_layers: 3
         use_actnorm: false
-        disc_r1_weight: 10.0
-        disc_r1_every: 16
 
 trainer:
   target: src.trainer.vae_trainers.WarpVAETrainer
@@ -57,16 +55,18 @@ data:
       type: precomputed_warp
       params:
         root_dir: "/visinf/projects_students/dlcv2025_groupZ/co3d_full"
-        bb_file: "/visinf/projects_students/dlcv2025_groupZ/co3d_annotations/hydrant_train.jgz"
-        warp_dir: "/visinf/projects_students/dlcv2025_groupZ/precomputed_warps/hydrant"
+        bb_file: "data/co3d_annotations/hydrant_train_50seq.jgz"
+        warp_dir: "/visinf/projects_students/dlcv2025_groupZ/precomputed_warps/hydrant_50seq_nocrop"
         image_size: ${training.image_size}
         confidence_threshold: 0.25
+        crop_images: false
     batch_size: ${training.batch_size}
     val_split: ${training.val_split}
     num_workers: ${training.num_workers}
     pin_memory: true
     persistent_workers: true
     shuffle_train: true
+    prefetch_factor: 4
 
 training:
   batch_size: 2
@@ -74,8 +74,8 @@ training:
   num_workers: 4
   val_split: 0.2
   num_epochs: 20
-  lr: 1e-5
-  kl_weight: 1e-05
+  lr: 1.0e-5
+  kl_weight: 0.00001
   lpips_loss_weight: 1.0
   ema_decay: 0.9999
   precision: 32
@@ -84,7 +84,7 @@ training:
   checkpoint_every_n_steps: 5000
   log_every_n_steps: 50
   gradient_accumulation_steps: 4
-  note: "hydrant-warp+recon"
+  note: "hydrant 50seq nocrop, from scratch, warp_w=1, warp_recon_w=1, disc_w=0.5, disc_start=15k"
 
 wandb:
   enabled: true

@@ -1,0 +1,88 @@
+# EQ-VAE training on CO3D hydrant subset
+# Faithfully implements zelaki/eqvae training logic on CO3D instead of OmniObject3D
+#
+# Benchmarked: 1 GPU = 1.785 it/s (3.6 samples/s), 2 GPU DDP = 1.248 it/s per GPU (5.0 samples/s total)
+# 2 GPUs required: EQ-VAE variable-size decoder OOMs at bs=4 on single 11GB 1080 Ti
+#
+# Run: CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=eqvae_co3d_hydrant
+
+model:
+  base_learning_rate: 4.5e-6
+  target: ldm.models.autoencoder.EQVAEAutoencoder
+  params:
+    embed_dim: 4
+    monitor: val/rec_loss
+    image_key: "image"
+
+    # EQ-VAE specific parameters (matching zelaki/eqvae defaults)
+    p_prior: 0.5           # Probability of applying equivariance regularization
+    p_prior_s: 0.25        # Probability of low-res prior preservation (when not EQ-VAE)
+    anisotropic: false     # Isotropic scaling (not independent x/y)
+    use_rotation: true     # Enable 90-degree rotations
+    equivariance_weight: 1.0
+
+    ddconfig:
+      double_z: true
+      z_channels: 4
+      resolution: 256
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult: [1, 2, 4, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 50001
+        kl_weight: 0.000001
+        disc_weight: 0.5
+        perceptual_weight: 1.0
+        disc_in_channels: 3
+        disc_num_layers: 3
+        use_actnorm: false
+
+trainer:
+  target: src.trainer.vae_trainers.EQVAETrainer
+  params: {}
+
+data:
+  target: src.data.datamodule.VAEDataModule
+  params:
+    dataset_config:
+      type: co3d
+      params:
+        root_dir: "/visinf/projects_students/dlcv2025_groupZ/co3d_full"
+        bb_file: "/visinf/projects_students/dlcv2025_groupZ/co3d_annotations/hydrant_train.jgz"
+        image_size: 256
+        include_plucker: false
+        crop_images: true
+        apply_augmentation: false
+    batch_size: 2    # 2 per GPU × 2 GPUs = 4 effective (matches zelaki/eqvae reference)
+    val_split: 0.1
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    shuffle_train: true
+
+training:
+  batch_size: 2    # Per-GPU batch size for 2-GPU DDP run
+  image_size: 256
+  num_workers: 4
+  val_split: 0.1
+  num_epochs: 10
+  lr: 4.5e-6
+  kl_weight: 0.000001
+  lpips_loss_weight: 1.0
+  ema_decay: 0.9999
+  precision: 32    # fp16 OOMs on variable-size EQ-VAE decoder outputs on 1080 Ti
+  output_dir: "./outputs/eqvae_co3d_hydrant"
+  note: "EQ-VAE on CO3D hydrant - fidelity check vs zelaki/eqvae"
+
+wandb:
+  enabled: true
+  project: enhanced-VAE
+  entity: deep_cv
+  tags: ["eqvae", "equivariance", "co3d", "hydrant", "sanity-check"]
