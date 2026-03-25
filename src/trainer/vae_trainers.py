@@ -344,8 +344,13 @@ class EQVAETrainer(BaseVAETrainer):
         self.manual_backward(aeloss)
         opt_ae.step()
 
-        self.log(f"train/aeloss_scale-{scale}-{mode}", aeloss,
+        scale_val = scale[0] if isinstance(scale, tuple) else scale
+        self.log("train/aeloss", aeloss,
                  prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        self.log("train/eq_scale", float(scale_val),
+                 prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
+        self.log("train/eq_mode", float(mode == "latent"),
+                 prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
 
         # ========== Optimize Discriminator ==========
@@ -363,7 +368,7 @@ class EQVAETrainer(BaseVAETrainer):
         self.manual_backward(discloss)
         opt_disc.step()
 
-        self.log(f"train/discloss_scale-{scale}-{mode}", discloss,
+        self.log("train/discloss", discloss,
                  prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
         self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
 
@@ -516,13 +521,16 @@ class WarpVAETrainer(BaseVAETrainer):
     def _get_target_encoding(self, batch: Dict[str, Any]) -> torch.Tensor:
         """
         Encode target image to latent space.
+        Uses no_grad since the target latent serves as a fixed reference —
+        gradients flow through the source latent only.
 
         Returns:
             Latent code for target image (B, C, H, W)
         """
         target = self.get_input(batch, self.target_key)
-        posterior = self.model.encode(target)
-        return posterior.sample()
+        with torch.no_grad():
+            posterior = self.model.encode(target)
+            return posterior.sample()
 
     def _compute_warp_losses(
         self,
@@ -623,7 +631,9 @@ class WarpVAETrainer(BaseVAETrainer):
         is_accumulating = (batch_idx + 1) % self.gradient_accumulation_steps != 0
         accum_steps = self.gradient_accumulation_steps
 
-        # Get source image and encoding
+        # Get source image and encoding.
+        # sample_posterior=True draws z for decoding; we reuse the same posterior
+        # sample for latent_a so both gradient paths refer to the same z.
         inputs = self.get_input(batch, self.image_key)
         reconstructions, posterior = self.model(inputs, sample_posterior=True)
         latent_a = posterior.sample()

@@ -131,18 +131,22 @@ class WarpConsistencyLoss(nn.Module):
 
         if self.loss_type == "l1":
             loss = torch.abs(pred - target)
+
         elif self.loss_type == "l2":
             loss = (pred - target) ** 2
+
         elif self.loss_type == "cosine":
             # Cosine similarity loss (1 - cos_sim)
             cos_sim = F.cosine_similarity(pred, target, dim=1)  # (B, H, W)
             loss = 1 - cos_sim
             loss = loss.unsqueeze(1)  # (B, 1, H, W) for consistent shape
+
         elif self.loss_type == "combined":
             # Combination of L1 and cosine
             l1_loss = torch.abs(pred - target)
             cos_sim = F.cosine_similarity(pred, target, dim=1).unsqueeze(1)
             loss = l1_loss + 0.5 * (1 - cos_sim)
+            
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
