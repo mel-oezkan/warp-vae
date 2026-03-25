@@ -28,6 +28,7 @@ from .camera_utils import (
 
 from .visualization import (
     latent_to_pca_rgb,
+    latent_to_pca_jet,
     visualize_reconstructions,
     visualize_latent_channels,
     visualize_latent_pca,
@@ -66,6 +67,7 @@ __all__ = [
     "extract_co3d_camera_positions",
     # Visualization
     "latent_to_pca_rgb",
+    "latent_to_pca_jet",
     "visualize_reconstructions",
     "visualize_latent_channels",
     "visualize_latent_pca",
