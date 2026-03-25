@@ -19,8 +19,6 @@ class LPIPSWithDiscriminator(nn.Module):
         use_actnorm=False,
         disc_conditional=False,
         disc_loss="hinge",
-        disc_r1_weight=10.0,
-        disc_r1_every=16,
     ):
         super().__init__()
         assert disc_loss in ["hinge", "vanilla"]
@@ -42,39 +40,25 @@ class LPIPSWithDiscriminator(nn.Module):
         self.disc_factor = disc_factor
         self.discriminator_weight = disc_weight
         self.disc_conditional = disc_conditional
-        self.disc_r1_weight = disc_r1_weight
-        self.disc_r1_every = disc_r1_every
 
     def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
-        """
-        Calculate adaptive weight with optimized memory usage.
-
-        Uses create_graph=False to avoid building computation graphs for gradients.
-        Must retain graph since this is called during forward pass.
-        """
         if last_layer is not None:
             target_layer = last_layer
         else:
             target_layer = self.last_layer[0]
 
-        # Compute gradients separately with create_graph=False to save memory
-        # Must use retain_graph=True for both since we're inside the forward pass
         nll_grads = torch.autograd.grad(
             nll_loss,
             target_layer,
             retain_graph=True,
-            create_graph=False,  # Don't build graph for gradient itself - saves memory
+            create_graph=False,
         )[0]
 
         g_grads = torch.autograd.grad(
             g_loss, target_layer, retain_graph=True, create_graph=False
         )[0]
 
-        # Compute weight with detached gradients
-        d_weight = torch.norm(nll_grads.detach()) / (
-            torch.norm(g_grads.detach()) + 1e-4
-        )
-        
+        d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
         d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
         d_weight = d_weight * self.discriminator_weight
         return d_weight
@@ -162,16 +146,7 @@ class LPIPSWithDiscriminator(nn.Module):
 
         if optimizer_idx == 1:
             # second pass for discriminator update
-            # For R1 penalty, we need gradients w.r.t. real inputs.
-            # Only apply during training (not validation where torch.no_grad() is active).
-            apply_r1 = (
-                self.training
-                and self.disc_r1_weight > 0
-                and global_step % self.disc_r1_every == 0
-            )
             real_input = inputs.contiguous().detach()
-            if apply_r1:
-                real_input.requires_grad_(True)
 
             if cond is None:
                 logits_real = self.discriminator(real_input)
@@ -189,24 +164,9 @@ class LPIPSWithDiscriminator(nn.Module):
             )
             d_loss = disc_factor * self.disc_loss(logits_real, logits_fake)
 
-            # R1 gradient penalty: penalizes large discriminator gradients on real data.
-            # This prevents discriminator logits from growing unboundedly, which would
-            # cause g_loss = -mean(logits_fake) to become very negative and make ae_loss < 0.
-            r1_penalty = torch.tensor(0.0, device=d_loss.device)
-            if apply_r1:
-                r1_grads = torch.autograd.grad(
-                    outputs=logits_real.sum(),
-                    inputs=real_input,
-                    create_graph=True,
-                )[0]
-                r1_penalty = r1_grads.pow(2).reshape(r1_grads.shape[0], -1).sum(1).mean()
-                # Scale by disc_r1_every to get correct effective weight (lazy regularization)
-                d_loss = d_loss + disc_factor * self.disc_r1_weight / 2 * r1_penalty * self.disc_r1_every
-
             log = {
                 "{}/disc_loss".format(split): d_loss.clone().detach().mean(),
                 "{}/logits_real".format(split): logits_real.detach().mean(),
                 "{}/logits_fake".format(split): logits_fake.detach().mean(),
-                "{}/r1_penalty".format(split): r1_penalty.detach(),
             }
             return d_loss, log
