@@ -227,7 +227,7 @@ def parse_args():
     parser.add_argument(
         "--imagenet_dir",
         type=str,
-        default="/data/lab_moezkan/imagenet-256",
+        default="/visinf/projects_students/dlcv2025_groupZ/imagenet-256",
         help="ImageNet dataset root directory",
     )
     parser.add_argument(
