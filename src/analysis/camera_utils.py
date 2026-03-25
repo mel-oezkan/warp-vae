@@ -173,8 +173,8 @@ def compute_relative_pose_distance(
 
 def find_overlapping_pairs(
     distance_matrix: np.ndarray,
-    max_distance: float = 3.0,
-    min_distance: float = 0.5
+    max_distance: float = None,
+    min_distance: float = None
 ) -> List[Tuple[int, int, float]]:
     """Find view pairs with distance in specified range.
 
@@ -182,8 +182,8 @@ def find_overlapping_pairs(
 
     Args:
         distance_matrix: (N, N) pairwise distance matrix
-        max_distance: Maximum distance to consider
-        min_distance: Minimum distance (to avoid nearly identical views)
+        max_distance: Maximum distance to consider (None = no upper limit)
+        min_distance: Minimum distance (None = no lower limit)
 
     Returns:
         List of (i, j, distance) tuples sorted by distance
@@ -193,7 +193,8 @@ def find_overlapping_pairs(
     for i in range(n):
         for j in range(i + 1, n):
             dist = distance_matrix[i, j]
-            if min_distance <= dist <= max_distance:
+            if (min_distance is None or dist >= min_distance) and \
+               (max_distance is None or dist <= max_distance):
                 pairs.append((i, j, dist))
     return sorted(pairs, key=lambda x: x[2])
 

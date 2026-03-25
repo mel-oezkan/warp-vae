@@ -46,6 +46,49 @@ def latent_to_pca_rgb(
     return lat_rgb, pca_model
 
 
+def latent_to_pca_jet(
+    latent: torch.Tensor,
+    pca_model: Optional[PCA] = None,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+) -> Tuple[np.ndarray, PCA]:
+    """Convert latent tensor to RGB image by mapping PC1 through the jet colormap.
+
+    Args:
+        latent: Tensor of shape (1, C, H, W) or (C, H, W)
+        pca_model: Optional fitted PCA model (must have >= 1 component). Fits a new one if None.
+        vmin: Global minimum for normalization. If None, uses this image's 2nd percentile.
+        vmax: Global maximum for normalization. If None, uses this image's 98th percentile.
+
+    Returns:
+        RGB image as numpy array (H, W, 3), values in [0, 1]
+        Fitted PCA model
+    """
+    if latent.dim() == 4:
+        latent = latent[0]
+
+    C, H, W = latent.shape
+    lat_flat = latent.cpu().numpy().reshape(C, -1).T  # (H*W, C)
+
+    if pca_model is None:
+        pca_model = PCA(n_components=1)
+        pca_model.fit(lat_flat)
+
+    pc1 = pca_model.transform(lat_flat)[:, 0].reshape(H, W)
+
+    if vmin is None or vmax is None:
+        local_vmin, local_vmax = np.percentile(pc1, [2, 98])
+        if vmin is None:
+            vmin = local_vmin
+        if vmax is None:
+            vmax = local_vmax
+
+    pc1_norm = np.clip((pc1 - vmin) / (vmax - vmin + 1e-8), 0, 1)
+    jet_rgb = plt.cm.jet(pc1_norm)[..., :3]  # (H, W, 3), drop alpha
+
+    return jet_rgb, pca_model
+
+
 def visualize_reconstructions(data: dict, save_path: str, n_samples: int = 10) -> None:
     """Create reconstruction grid: original vs reconstructed.
 
