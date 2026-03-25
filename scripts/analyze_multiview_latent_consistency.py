@@ -96,6 +96,18 @@ MODEL_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
                 '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
 
 
+def compute_distance_bins(all_results: Dict[str, List[Dict]], n_bins: int = 5) -> List[Tuple[float, float]]:
+    """Compute distance bins dynamically from the data."""
+    all_distances = []
+    for results in all_results.values():
+        all_distances.extend([r["camera_distance"] for r in results])
+    if not all_distances:
+        return [(0, 1)]
+    min_d, max_d = min(all_distances), max(all_distances)
+    edges = np.linspace(min_d, max_d, n_bins + 1)
+    return [(round(edges[i], 2), round(edges[i+1], 2)) for i in range(n_bins)]
+
+
 class DatasetAdapter:
     """Unified interface for iterating over multi-view objects/sequences."""
 
@@ -445,8 +457,8 @@ def analyze_object_with_models(
     obj_id,
     transform,
     device: str,
-    max_distance: float = 60,
-    min_distance: float = 2,
+    max_distance: float = None,
+    min_distance: float = None,
     max_pairs: int = 50
 ) -> Dict[str, List[Dict]]:
     """Analyze latent consistency for a single object across all models.
@@ -630,8 +642,8 @@ def analyze_object_with_roma(
     obj_id,
     transform_vae,
     device: str,
-    max_distance: float = 60,
-    min_distance: float = 2,
+    max_distance: float = None,
+    min_distance: float = None,
     max_pairs: int = 50,
     confidence_threshold: float = 0.8,
     image_size: int = 256,
@@ -849,7 +861,7 @@ def visualize_model_comparison(
 
     # Plot 6: Binned cosine similarity comparison
     ax6 = axes[1, 2]
-    dist_bins = [(0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 5.0)]
+    dist_bins = compute_distance_bins(all_results)
     bin_labels = [f"{low}-{high}" for low, high in dist_bins]
     x = np.arange(len(bin_labels))
     width = 0.8 / len(model_names)
@@ -1335,7 +1347,7 @@ def visualize_roma_model_comparison(
 
     # Plot 7: Binned Region Cosine
     ax7 = axes[2, 0]
-    dist_bins = [(0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 5.0)]
+    dist_bins = compute_distance_bins(all_results)
     bin_labels = [f"{low}-{high}" for low, high in dist_bins]
     x = np.arange(len(bin_labels))
     width = 0.8 / max(len(model_names), 1)
@@ -1503,7 +1515,7 @@ def save_roma_comparison_stats(
         f.write("\nBinned Comparison (Region Cosine Similarity)\n")
         f.write("=" * 70 + "\n")
 
-        dist_bins = [(0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 5.0)]
+        dist_bins = compute_distance_bins(all_results)
 
         header = f"{'Bin':<12}" + "".join([f"{name[:12]:<14}" for name in model_names])
         f.write(header + "\n")
@@ -1585,7 +1597,7 @@ def save_comparison_stats(
         f.write("\nBinned Comparison (Cosine Similarity)\n")
         f.write("=" * 70 + "\n")
 
-        dist_bins = [(0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 5.0)]
+        dist_bins = compute_distance_bins(all_results)
 
         header = f"{'Bin':<12}" + "".join([f"{name[:12]:<14}" for name in model_names])
         f.write(header + "\n")
@@ -1698,12 +1710,12 @@ def parse_args():
         help="Number of objects for detailed per-object visualizations"
     )
     parser.add_argument(
-        "--max_distance", type=float, default=3.0,
-        help="Maximum camera Euclidean distance for pair selection"
+        "--max_distance", type=float, default=None,
+        help="Maximum camera Euclidean distance for pair selection (default: no limit)"
     )
     parser.add_argument(
-        "--min_distance", type=float, default=0.5,
-        help="Minimum camera Euclidean distance for pair selection"
+        "--min_distance", type=float, default=None,
+        help="Minimum camera Euclidean distance for pair selection (default: no limit)"
     )
     parser.add_argument(
         "--image_size", type=int, default=256,
