@@ -8,7 +8,7 @@ import torch
 from coolname import generate_slug
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
 import wandb
@@ -19,6 +19,44 @@ from data_process.omniobject_dataset import OmniObjectDataModule
 from src.dataset.co3d import Co3DDataModule
 
 torch.cuda.empty_cache()
+
+
+class ImageLoggerCallback(Callback):
+    """Periodically logs input/reconstruction image grids to wandb."""
+
+    def __init__(self, every_n_steps=500, max_images=4):
+        super().__init__()
+        self.every_n_steps = every_n_steps
+        self.max_images = max_images
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if trainer.global_step % self.every_n_steps != 0 or trainer.global_step == 0:
+            return
+        if trainer.logger is None:
+            return
+
+        self._log(trainer, pl_module, batch, "train")
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        if batch_idx != 0:
+            return
+        if trainer.logger is None:
+            return
+
+        self._log(trainer, pl_module, batch, "val")
+
+    @torch.no_grad()
+    def _log(self, trainer, pl_module, batch, split):
+        images = pl_module.log_images(batch)
+        for key, img_tensor in images.items():
+            img_tensor = img_tensor[:self.max_images].detach().cpu()
+            # Clamp to [0, 1] for logging (model outputs may be in [-1, 1])
+            img_tensor = (img_tensor + 1.0) / 2.0
+            img_tensor = img_tensor.clamp(0, 1)
+            trainer.logger.experiment.log(
+                {f"{split}/{key}": [wandb.Image(img) for img in img_tensor]},
+                step=trainer.global_step,
+            )
 
 
 
@@ -251,6 +289,11 @@ def main(cfg: DictConfig):
             every_n_epochs=cfg.training.get("checkpoint_every_n_epochs", 5),
             save_last=True,
         ))
+
+    # Add image logging callback
+    if use_wandb:
+        log_img_every = cfg.training.get("log_images_every_n_steps", 5000)
+        checkpoint_callbacks.append(ImageLoggerCallback(every_n_steps=log_img_every))
 
     # Create PyTorch Lightning Trainer
     # Note: accumulate_grad_batches is NOT used here because we use manual optimization
