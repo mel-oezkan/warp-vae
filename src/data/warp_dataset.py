@@ -18,6 +18,7 @@ from PIL import Image
 from torchvision import transforms
 
 from src.data.base_dataset import BaseVAEDataset
+from data_process.co3d_dataset import square_bbox
 
 
 class WarpCO3DDataset(BaseVAEDataset):
@@ -382,6 +383,7 @@ class PrecomputedWarpDataset(BaseVAEDataset):
         image_size: int = 256,
         warp_resolution: Optional[int] = None,
         confidence_threshold: float = 0.1,
+        crop_images: bool = False,
         include_plucker: bool = False,
         n_patches: Optional[int] = None,
         transform: Optional[transforms.Compose] = None,
@@ -400,6 +402,7 @@ class PrecomputedWarpDataset(BaseVAEDataset):
         self.warp_dir = Path(warp_dir)
         self.warp_resolution = warp_resolution
         self.confidence_threshold = confidence_threshold
+        self.crop_images = crop_images
 
         # Load samples and pair mappings
         self.samples, self.pairs = self._load_samples_and_pairs(bb_file)
@@ -469,6 +472,18 @@ class PrecomputedWarpDataset(BaseVAEDataset):
         img_path = Path(self.root_dir) / sample_data["filepath"]
 
         pil_image = Image.open(img_path).convert("RGB")
+
+        if self.crop_images and "bbox" in sample_data:
+            bbox = square_bbox(np.array(sample_data["bbox"]))
+            bbox = np.around(bbox).astype(int)
+            pil_image = transforms.functional.crop(
+                pil_image,
+                top=bbox[1],
+                left=bbox[0],
+                height=bbox[3] - bbox[1],
+                width=bbox[2] - bbox[0],
+            )
+
         pil_image = pil_image.resize((self.image_size, self.image_size), Image.LANCZOS)
 
         return self.transform(pil_image)
