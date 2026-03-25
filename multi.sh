@@ -49,23 +49,45 @@
 #     --n_detailed_objects 5
 
 python scripts/analyze_multiview_latent_consistency.py \
-    --dataset co3d \
+    --dataset co3d_native \
     --checkpoints \
-        checkpoints/statuesque-super-cuckoo-of-anger/last.ckpt \
-        checkpoints/eq-vae/diffusion_pytorch_model.safetensors \
+        "checkpoints/accurate-courageous-agama-of-authority_EQ-VAE on CO3D hydrant 50seq, step-matched to Warp VAE e4ksa79v (~58K steps)/last.ckpt" \
+        "checkpoints/tested-fine-trout-of-authority_hydrant 50seq nocrop, from scratch, warp_w=1, warp_recon_w=1, disc_w=0.5, disc_start=15k/last.ckpt" \
+        "checkpoints/gentle-horned-grasshopper-of-serendipity_hydrant 50seq nocrop, toybus-matched hparams: kl=1e-5, warp_w=1, disc_w=0.5, disc_start=15k, grad_accum=4/last.ckpt" \
         weights/f8/model.ckpt \
     --configs \
-        config/warp_vae_co3d_precomputed.yaml \
-        checkpoints/eq-vae/config.json \
+        config/eqvae_co3d_hydrant_50seq.yaml \
+        config/warp_vae_hydrant_recon.yaml \
+        config/warp_vae_hydrant.yaml \
         config/baseVAE.yaml \
-    --model_names "WARP-VAE" "EQ-VAE" "SD-VAE" \
+    --model_names "EQ-VAE" "Warp-VAE (recon)" "Warp-VAE (toybus-hp)" "SD-VAE" \
     --mode roma \
-    --roma_setting fast \
+    --roma_setting turbo \
     --roma_confidence_threshold 0.2 \
     --max_distance 3.0 \
     --min_distance 0.5 \
-    --precomputed_warps_dir /visinf/projects_students/dlcv2025_groupZ/precomputed_warps/hydrant \
-    --output_name full_comparison_co3d
+    --co3d_native_dir /visinf/projects_students/dlcv2025_groupZ/co3d_data \
+    --output_name full_comparison_co3d_native
+
+# Same eval but without distance filtering (all pairs)
+python scripts/analyze_multiview_latent_consistency.py \
+    --dataset co3d_native \
+    --checkpoints \
+        "checkpoints/accurate-courageous-agama-of-authority_EQ-VAE on CO3D hydrant 50seq, step-matched to Warp VAE e4ksa79v (~58K steps)/last.ckpt" \
+        "checkpoints/tested-fine-trout-of-authority_hydrant 50seq nocrop, from scratch, warp_w=1, warp_recon_w=1, disc_w=0.5, disc_start=15k/last.ckpt" \
+        "checkpoints/gentle-horned-grasshopper-of-serendipity_hydrant 50seq nocrop, toybus-matched hparams: kl=1e-5, warp_w=1, disc_w=0.5, disc_start=15k, grad_accum=4/last.ckpt" \
+        weights/f8/model.ckpt \
+    --configs \
+        config/eqvae_co3d_hydrant_50seq.yaml \
+        config/warp_vae_hydrant_recon.yaml \
+        config/warp_vae_hydrant.yaml \
+        config/baseVAE.yaml \
+    --model_names "EQ-VAE" "Warp-VAE (recon)" "Warp-VAE (toybus-hp)" "SD-VAE" \
+    --mode roma \
+    --roma_setting turbo \
+    --roma_confidence_threshold 0.2 \
+    --co3d_native_dir /visinf/projects_students/dlcv2025_groupZ/co3d_data \
+    --output_name full_comparison_co3d_native_alldist
 
 # # RoMA mode only
 # python scripts/analyze_multiview_latent_consistency.py \
