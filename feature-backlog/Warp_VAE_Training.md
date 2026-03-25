@@ -80,7 +80,7 @@ where:
   L_L1  = mean(|inputs - reconstructions|)           # pixel-wise L1
   L_KL  = KL(posterior || N(0,1))                    # latent regularization
   L_G   = -mean(discriminator(reconstructions))      # generator adversarial loss
-  d_weight = ||∇_L_rec|| / (||∇_L_G|| + 1e-4)       # adaptive balancing weight
+  d_weight = EMA-normalised gradient ratio            # adaptive balancing weight (GradNorm-inspired)
   disc_factor = 0 until disc_start steps, then 1     # discriminator warmup
 ```
 
@@ -94,38 +94,37 @@ loss = sum(nll_loss) + kl_weight * kl_loss + d_weight * disc_factor * g_loss
 **Discriminator loss (separate optimizer):**
 
 ```
-L_disc = disc_factor * L_hinge(logits_real, logits_fake) + disc_factor * (r1_weight/2) * R1 * r1_every
+L_disc = disc_factor * L_hinge(logits_real, logits_fake)
 
 Hinge loss:  0.5 * (mean(relu(1 - logits_real)) + mean(relu(1 + logits_fake)))
 Vanilla GAN: 0.5 * (mean(softplus(-logits_real)) + mean(softplus(logits_fake)))
-R1 penalty:  mean(||∇_x D(x_real)||^2)  — penalizes large discriminator gradients on real data
 ```
 
-**R1 Gradient Penalty:**
+**Adaptive Weight (`d_weight`) — EMA-Normalised GradNorm:**
 
-The R1 penalty (from "Which Training Methods for GANs do actually Converge?", Mescheder et al. 2018) prevents discriminator logits from growing unboundedly, which is critical for stable training with hinge loss + gradient accumulation. Without R1:
+The original `d_weight = ‖nll_grads‖ / ‖g_grads‖` is scale-sensitive: when the generator is pre-warmed by the warp loss, `g_grads` at discriminator activation are near-zero, making the ratio explode. The current implementation normalises each gradient norm by its own EMA before taking the ratio:
 
-1. Hinge discriminator loss saturates to 0 once logits pass margin of 1
-2. Discriminator stops receiving gradients, but its logits keep growing
-3. `g_loss = -mean(logits_fake)` becomes very negative (observed: -168)
-4. Adaptive weight `d_weight` hits clamp ceiling (5000)
-5. `d_weight * g_loss = 5000 * (-168) = -840,000` overwhelms `nll_loss ≈ 70,000`
-6. **Result: ae_loss goes negative** (observed: -773,000 in run `overjoyed-melodic-swine-of-economy`)
+```python
+# Current implementation (scale-invariant):
+ema_nll = decay * ema_nll + (1 - decay) * norm(nll_grads)
+ema_g   = decay * ema_g   + (1 - decay) * norm(g_grads)
+d_weight = (norm(nll_grads) / ema_nll) / (norm(g_grads) / ema_g + 1e-4)
+d_weight = d_weight * discriminator_weight   # no hard clamp
+```
 
-The R1 penalty uses **lazy regularization** (only applied every `disc_r1_every` steps) to reduce computational overhead, with the weight scaled by `disc_r1_every` to maintain the correct effective penalty.
+Both EMAs are stored as `nn.Module` buffers (move with `.to(device)`, included in `state_dict`). The hard clamp from earlier versions has been removed entirely. This is the GradNorm normalisation step (Chen et al., 2018) applied to the two-term GAN+reconstruction balance.
 
 **Key hyperparameters:**
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `disc_start` | Step at which discriminator activates | 50001 (small), 15000 (precomputed) |
-| `kl_weight` | KL divergence regularization weight | 1e-6 (small), 1e-5 (precomputed) |
+| `disc_start` | Step at which discriminator activates | 50001 |
+| `kl_weight` | KL divergence regularization weight | 1e-6 |
 | `perceptual_weight` | LPIPS loss weight | 1.0 |
-| `disc_weight` | Adaptive discriminator weight cap | 0.5 |
+| `disc_weight` | Multiplier on d_weight after normalisation | 0.5 |
 | `disc_factor` | Base discriminator scaling factor | 1.0 |
 | `disc_loss` | GAN loss type | `"hinge"` or `"vanilla"` |
-| `disc_r1_weight` | R1 gradient penalty weight | 10.0 |
-| `disc_r1_every` | Apply R1 every N steps (lazy reg) | 16 |
+| `grad_norm_ema_decay` | EMA decay for GradNorm normalisation | 0.99 |
 
 #### 2b. Perceptual Loss: `LPIPS`
 
@@ -204,8 +203,12 @@ class WarpVAETrainer(BaseVAETrainer):
 
     def training_step(self, batch, batch_idx):
         # 1. Encode source → reconstruction + posterior + latent_a
-        recon_a, posterior_a = self.model(img_a, sample_posterior=True)
-        latent_a = posterior_a.sample()
+        # Use sample_posterior=False so reconstructions and latent_a reference the
+        # same deterministic posterior mean. sample_posterior=True would draw z1
+        # for the decode and z2 for latent_a, giving the encoder two gradient
+        # signals from different latent points — incoherent and noisy.
+        recon_a, posterior_a = self.model(img_a, sample_posterior=False)
+        latent_a = posterior_a.mode()
 
         # 2. Decide whether to skip warp loss (vanilla_probability)
         use_vanilla_only = torch.rand(1).item() < self.vanilla_probability
@@ -215,7 +218,7 @@ class WarpVAETrainer(BaseVAETrainer):
 
         # 4. Compute warp consistency loss (if not vanilla mode)
         if not use_vanilla_only:
-            latent_b = self.model.encode(img_b).sample()
+            latent_b = self.model.encode(img_b).mode()  # deterministic mode, not sample()
             warp_loss = self.warp_consistency_loss(
                 latent_a, latent_b, warp_ab, warp_ba, conf_ab, conf_ba
             )
@@ -249,7 +252,7 @@ class WarpVAETrainer(BaseVAETrainer):
 
 ## Configuration
 
-**File:** `config/warp_vae_co3d_small.yaml`
+**Primary config:** `config/warp_vae_hydrant.yaml`
 
 ```yaml
 model:
@@ -257,36 +260,54 @@ model:
   params:
     embed_dim: 4
     ddconfig:
-      resolution: 128
-      ch: 64
-      ch_mult: [1, 2, 4]
-      # ... standard VAE config
+      resolution: ${training.image_size}
+      ch: 128
+      ch_mult: [1, 2, 4, 4]
+      # ... standard VAE config (matches SD-VAE 2.1)
+
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 50001
+        kl_weight: 0.000001
+        disc_weight: 0.5
+        grad_norm_ema_decay: 0.99  # EMA-normalised adaptive weight (GradNorm-inspired)
 
 trainer:
   target: src.trainer.vae_trainers.WarpVAETrainer
   params:
     target_key: "image_target"
-    warp_consistency_weight: 0.5
+    warp_consistency_weight: 1.0
     warp_reconstruction_weight: 0.0
     consistency_loss_type: "l1"
     bidirectional: true
     confidence_weighted: true
-    warmup_steps: 1000
-    vanilla_probability: 0.5              # Set > 0 to randomly skip warp loss
+    loss_confidence_threshold: 0.2
+    warmup_steps: 5000
+    vanilla_probability: 0              # Always use warp loss
+    gradient_accumulation_steps: 1      # No accumulation (matches EQ-VAE reference)
 
 data:
   target: src.data.datamodule.VAEDataModule
   params:
     dataset_config:
-      type: warp_co3d              # Uses WarpCO3DDataset
+      type: precomputed_warp             # Uses PrecomputedWarpDataset (no RoMaV2!)
       params:
-        root_dir: "/data/lab_moezkan/co3d_full"
-        bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
-        image_size: 128
-        romav2_setting: "turbo"
-        pair_sampling: "random"
-        max_pair_distance: 10
-    num_workers: 0                 # MUST be 0 for RoMaV2 (CUDA in workers)
+        root_dir: "/visinf/projects_students/dlcv2025_groupZ/co3d_full"
+        bb_file: "...hydrant_train.jgz"
+        warp_dir: "...precomputed_warps/hydrant_cropped"
+        image_size: ${training.image_size}
+        confidence_threshold: 0.25
+        crop_images: true               # Warps computed on cropped images
+    num_workers: 4                      # Parallel loading OK (no CUDA in workers)
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 4
+
+training:
+  batch_size: 2                         # Per-GPU (2 GPUs × 2 = 4 effective)
+  precision: 32                         # fp16 not used (stability)
+  limit_train_batches: 21000            # Cap epoch to match EQ-VAE wall time
 ```
 
 ## Training Pipeline Flow
@@ -484,58 +505,40 @@ Key metrics to track in WandB:
 - `val/warp_loss`: Validation warp consistency (generalization check)
 ## Training Commands
 
-### Small Model (ch=64, for testing/limited VRAM)
+### Warp-consistency only (primary config)
 ```bash
-# Small model at 128x128
-python train.py --config-name=warp_vae_co3d_small
+# Full SD-VAE 2.1 on CO3D hydrant with precomputed warps, warp-consistency loss only
+CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_hydrant
 ```
 
-### Full SD-VAE 2.1 Architecture (ch=128, production)
+### Warp-consistency + image-space reconstruction loss
 ```bash
-# Full SD-VAE architecture at 256x256
-# Requires ~11GB VRAM per GPU (fits on GTX 1080 Ti with batch_size=2)
-python train.py --config-name=warp_vae_co3d
+# Adds WarpReconstructionLoss on top of warp consistency
+CUDA_VISIBLE_DEVICES=1 python train.py --config-name=warp_vae_hydrant_recon
 ```
 
-### Precomputed Warps (Recommended for Production)
+### Precompute warps first (one-time, see ROMA_PRECOMPUTE_SPEEDUP.md)
 ```bash
-# Step 1: Precompute RoMaV2 warps (one-time, can run overnight)
-# Single GPU:
-python precompute_warps.py \
-    --bb_file /data/lab_moezkan/co3d_bboxes/toybus_test.jgz \
-    --output_dir /data/lab_moezkan/precomputed_warps/toybus \
-    --root_dir /data/lab_moezkan/co3d_full \
-    --romav2_setting turbo \
-    --max_pair_distance 20 \
-    --num_pairs_per_sample 3 \
-    --warp_resolution 256
-
-# Multi-GPU (1.8-2.0x speedup with 2 GPUs):
-python precompute_warps.py \
-    --bb_file /data/lab_moezkan/co3d_bboxes/toybus_test.jgz \
-    --output_dir /data/lab_moezkan/precomputed_warps/toybus \
-    --root_dir /data/lab_moezkan/co3d_full \
+# Step 1: Precompute RoMaV2 warps with stratified distance sampling
+CUDA_VISIBLE_DEVICES=0,1 python precompute_warps.py \
+    --annotation_file /visinf/projects_students/dlcv2025_groupZ/co3d_annotations/hydrant_train.jgz \
+    --output_dir /visinf/projects_students/dlcv2025_groupZ/precomputed_warps/hydrant_cropped \
+    --root_dir /visinf/projects_students/dlcv2025_groupZ/co3d_full \
     --num_workers 2 --gpu_ids 0 1 \
     --romav2_setting turbo \
-    --max_pair_distance 20 \
-    --num_pairs_per_sample 3
+    --crop_images \
+    --distance_bins 0.5 1.5 2.5 3.0 \
+    --num_pairs_per_bin 1 \
+    --cycle_consistency_threshold 0.1
 
-# Resume interrupted computation:
-python precompute_warps.py \
-    --bb_file /data/lab_moezkan/co3d_bboxes/toybus_test.jgz \
-    --output_dir /data/lab_moezkan/precomputed_warps/toybus \
-    --root_dir /data/lab_moezkan/co3d_full \
-    --num_workers 2 --gpu_ids 0 1 --resume
-
-# Step 2: Train with precomputed warps (much faster!)
-CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_co3d_precomputed
+# Step 2: Train (warp_dir must match output_dir above, with crop_images: true in config)
+CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_hydrant
 ```
 
-### Specifying GPUs (optional)
+### Specifying GPUs
 ```bash
-# Use specific GPU(s)
-CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_co3d
-CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_co3d
+CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_hydrant
+CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_hydrant
 ```
 
 ## Precomputed Warps Training
@@ -718,17 +721,18 @@ For example, with `confidence_threshold=0.25`:
 
 ### Configuration
 
-**File:** `config/warp_vae_co3d_precomputed.yaml`
+**File:** `config/warp_vae_hydrant.yaml`
 
-Key differences from online training config:
+Key settings for the precomputed-warp training pipeline:
 
 ```yaml
 model:
   params:
     lossconfig:
       params:
-        disc_start: 15000              # Discriminator activates at step 15k
-        kl_weight: 1e-05               # Increased KL for better latent regularization
+        disc_start: 50001              # Discriminator activates at step 50k
+        kl_weight: 0.000001            # Matches EQ-VAE reference
+        grad_norm_ema_decay: 0.99      # EMA for adaptive weight normalisation
 
 trainer:
   params:
@@ -736,24 +740,27 @@ trainer:
     loss_confidence_threshold: 0.2
     warmup_steps: 5000                 # 5k steps to ramp up warp loss
     vanilla_probability: 0             # Always use warp loss
-    gradient_accumulation_steps: 4     # Effective batch = batch_size * 4
+    gradient_accumulation_steps: 1     # No accumulation (matches EQ-VAE reference)
 
 data:
   params:
     dataset_config:
       type: precomputed_warp           # Uses PrecomputedWarpDataset (no RoMaV2!)
       params:
-        warp_dir: "/data/lab_moezkan/precomputed_warps/toybus"
-        confidence_threshold: 0.25     # Soft threshold for correspondences
-    num_workers: 4                     # Parallel data loading (no CUDA in dataloader)
+        warp_dir: ".../hydrant_cropped"  # Must use crop_images: true warp set
+        confidence_threshold: 0.25       # Soft threshold for correspondences
+        crop_images: true                # Must match how warps were computed
+    num_workers: 4                     # Parallel data loading (no CUDA in workers)
     pin_memory: true
     persistent_workers: true
+    prefetch_factor: 4                 # Pre-load 4 batches per worker
 
 training:
-  batch_size: 2                        # Can increase (no RoMaV2 memory overhead)
-  lr: 1e-5                             # Increased from 1e-6 for faster convergence
-  precision: 32                        # FP32 (avoids FP16 stability issues)
-  gradient_accumulation_steps: 4       # Effective batch size = 2 * 4 = 8
+  batch_size: 2                        # Per-GPU; 2 GPUs → 4 effective
+  lr: 4.5e-6
+  precision: 32                        # FP32 (fp16 not used)
+  gradient_accumulation_steps: 1
+  limit_train_batches: 21000           # Cap epoch to ~same wall time as EQ-VAE
 ```
 
 ### Performance Comparison
@@ -777,12 +784,11 @@ training:
 
 | Config | ch | ch_mult | z_channels | Downsampling | Image Size | Latent Size | Params |
 |--------|-----|---------|------------|--------------|------------|-------------|--------|
-| `warp_vae_co3d_small` | 64 | [1,2,4] | 4 | 8× | 128×128 | 16×16×4 | ~21M |
-| `warp_vae_co3d` | 128 | [1,2,4,4] | 4 | 8× | 256×256 | 32×32×4 | ~84M |
-| `warp_vae_co3d_precomputed` | 128 | [1,2,4,4] | 4 | 8× | 256×256 | 32×32×4 | ~84M |
+| `warp_vae_hydrant` | 128 | [1,2,4,4] | 4 | 8× | 256×256 | 32×32×4 | ~84M |
+| `warp_vae_hydrant_recon` | 128 | [1,2,4,4] | 4 | 8× | 256×256 | 32×32×4 | ~84M |
 | SD-VAE 2.1 (reference) | 128 | [1,2,4,4] | 4 | 8× | 768×768 | 96×96×4 | ~84M |
 
-**Note:** `warp_vae_co3d_precomputed` and `warp_vae_co3d` share the same model architecture (matching SD-VAE 2.1), differing only in the data pipeline (precomputed vs online warps) and training hyperparameters.
+Both hydrant configs share the same SD-VAE 2.1 architecture, differing only in whether the `WarpReconstructionLoss` is enabled.
 
 ## Expected Results
 
@@ -813,7 +819,7 @@ training:
 | `src/data/warp_dataset.py` | `WarpCO3DDataset` (online) and `PrecomputedWarpDataset` |
 | `src/losses/warp_consistency.py` | `WarpConsistencyLoss`, `WarpReconstructionLoss`, `CycleConsistencyLoss` |
 | `src/trainer/vae_trainers.py` | `WarpVAETrainer` class with gradient accumulation |
+| `ldm/modules/losses/contperceptual.py` | `LPIPSWithDiscriminator` with EMA-normalised adaptive weight |
 | `precompute_warps.py` | Multi-GPU script to precompute RoMaV2 warps |
-| `config/warp_vae_co3d_small.yaml` | Small model config (ch=64, 128×128, online warps) |
-| `config/warp_vae_co3d.yaml` | Full SD-VAE config (ch=128, 256×256, online warps) |
-| `config/warp_vae_co3d_precomputed.yaml` | Precomputed warps config (recommended for production) |
+| `config/warp_vae_hydrant.yaml` | Primary config: warp-consistency only, hydrant, precomputed |
+| `config/warp_vae_hydrant_recon.yaml` | Variant: adds image-space warp reconstruction loss |
