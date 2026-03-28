@@ -183,7 +183,40 @@ class WarpConsistencyLoss(nn.Module):
 |------|-------------|-----------------|
 | `WarpConsistencyLoss` | Enforces latent consistency across views | Yes |
 | `WarpReconstructionLoss` | Compares warped reconstruction to target image (pixel + optional LPIPS) | No (`warp_reconstruction_weight: 0.0`) |
+| `NaiveWarpConsistencyLoss` | EQ-VAE-style equivariance: `encode(warp(img)) ≈ warp(encode(img))` | Used by `NaiveWarpVAETrainer` |
 | `CycleConsistencyLoss` | Validates warp quality via A→B→A cycle error | No |
+
+#### 2d. Naive Warp Consistency Loss: `NaiveWarpConsistencyLoss`
+
+**File:** `src/losses/warp_consistency.py`
+
+Measures how well encoding commutes with warping — an EQ-VAE-style equivariance objective:
+
+```
+Left side:  encode(warp(image))   — encode the spatially-warped image
+Right side: warp(encode(image))   — warp the latent representation
+Loss = |left - right| weighted by confidence mask
+```
+
+Supports L1, L2, and cosine similarity losses. Combines in-bounds checks with confidence thresholds for masking. Uses `mode="nearest"` for warp interpolation (exact pixel alignment) and `padding_mode="zeros"` for out-of-bounds handling.
+
+**Parameters:**
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `loss_type` | `"l1"`, `"l2"`, or `"cosine"` | `"l1"` |
+| `confidence_weighted` | Weight by warp confidence | `true` |
+| `confidence_threshold` | Min valid confidence | `0.1` |
+| `bidirectional` | Compute both A→B and B→A | `true` |
+
+#### Recent Loss Improvements
+
+**WarpConsistencyLoss**: Changed warp/confidence interpolation from `mode="bilinear"` to `mode="nearest"` for sharper correspondences, and `padding_mode="border"` to `"zeros"` for cleaner out-of-bounds handling.
+
+**WarpReconstructionLoss**: Now supports decomposed pixel + perceptual loss weights:
+```python
+total_loss = pixel_weight * pixel_loss + perceptual_weight * perceptual_loss
+```
+New parameters: `pixel_weight` (default 1.0), `perceptual_weight` (default 0.0), and optional `lpips_model` injection. Improved mask handling with explicit in-bounds computation before warping.
 
 ### 3. Trainer: `WarpVAETrainer`
 
@@ -202,13 +235,10 @@ class WarpVAETrainer(BaseVAETrainer):
     """
 
     def training_step(self, batch, batch_idx):
-        # 1. Encode source → reconstruction + posterior + latent_a
-        # Use sample_posterior=False so reconstructions and latent_a reference the
-        # same deterministic posterior mean. sample_posterior=True would draw z1
-        # for the decode and z2 for latent_a, giving the encoder two gradient
-        # signals from different latent points — incoherent and noisy.
-        recon_a, posterior_a = self.model(img_a, sample_posterior=False)
-        latent_a = posterior_a.mode()
+        # 1. Encode source → reconstruction + posterior + latent z
+        # Uses return_latent=True to get the EXACT z used for decoding
+        # (critical for gradient consistency with warp loss)
+        recon_a, posterior_a, z_a = self.model(img_a, return_latent=True)
 
         # 2. Decide whether to skip warp loss (vanilla_probability)
         use_vanilla_only = torch.rand(1).item() < self.vanilla_probability
@@ -218,10 +248,15 @@ class WarpVAETrainer(BaseVAETrainer):
 
         # 4. Compute warp consistency loss (if not vanilla mode)
         if not use_vanilla_only:
-            latent_b = self.model.encode(img_b).mode()  # deterministic mode, not sample()
+            # Gradients enabled through target encoding (symmetric learning)
+            posterior_b = self.model.encode(img_b)
+            latent_b = posterior_b.mode()
             warp_loss = self.warp_consistency_loss(
-                latent_a, latent_b, warp_ab, warp_ba, conf_ab, conf_ba
+                z_a, latent_b, warp_ab, warp_ba, conf_ab, conf_ba
             )
+            # Normalize by latent spatial dimensions for scale-comparable loss
+            latent_spatial = z_a.shape[2] * z_a.shape[3]
+            warp_loss = warp_loss / latent_spatial
 
         # 5. Combine with warmup factor
         warp_factor = min(1.0, global_step / warmup_steps)
@@ -235,6 +270,8 @@ class WarpVAETrainer(BaseVAETrainer):
             opt_ae.zero_grad()
 
         # 7. Same pattern for discriminator optimizer
+        # Note: reconstructions are detached before discriminator backward
+        # to reduce peak memory usage
 ```
 
 **Key Parameters:**
@@ -242,6 +279,8 @@ class WarpVAETrainer(BaseVAETrainer):
 |-----------|-------------|---------|
 | `warp_consistency_weight` | Weight for warp loss | 1.0 |
 | `warp_reconstruction_weight` | Weight for image-space warp loss | 0.0 |
+| `warp_recon_pixel_weight` | Weight for pixel-level reconstruction in warp recon loss | 1.0 |
+| `warp_recon_perceptual_weight` | Weight for LPIPS perceptual loss in warp recon loss | 0.0 |
 | `consistency_loss_type` | `"l1"`, `"l2"`, `"cosine"`, `"combined"` | `"l1"` |
 | `bidirectional` | Compute both A→B and B→A | `true` |
 | `confidence_weighted` | Weight by RoMaV2 confidence | `true` |
@@ -812,14 +851,273 @@ Both hydrant configs share the same SD-VAE 2.1 architecture, differing only in w
 | Reconstruction L1 | ~0.45 | <0.15 |
 | Warp L1 Error | ~0.30 | ~0.30 (depends on data) |
 
+## Naive Warp VAE (EQ-VAE-style Equivariance)
+
+### Overview
+
+The `NaiveWarpVAETrainer` implements an alternative approach where the encoder must commute with image warping:
+
+```
+encode(warp(image)) ≈ warp(encode(image))
+```
+
+Unlike `WarpVAETrainer` which compares two independently encoded views in latent space, this approach checks whether spatial transformations can be applied before or after encoding with the same result — a direct equivariance test.
+
+### Key Differences from WarpVAETrainer
+
+| Aspect | WarpVAETrainer | NaiveWarpVAETrainer |
+|--------|---------------|---------------------|
+| Loss target | `warp(latent_A) ≈ latent_B` | `encode(warp(img)) ≈ warp(encode(img))` |
+| Target encoding | Encodes target image separately | No separate target encoding needed |
+| Gradient flow | Through both source and target | Through encoder on warped input |
+| Conceptual basis | Multi-view consistency | Equivariance (EQ-VAE-style) |
+
+### Configuration
+
+**Config:** `config/naive_warp_vae_hydrant.yaml`
+
+```yaml
+trainer:
+  target: src.trainer.vae_trainers.NaiveWarpVAETrainer
+  params:
+    naive_warp_weight: 0.02
+    consistency_loss_type: "l1"
+    bidirectional: true
+    confidence_weighted: true
+    loss_confidence_threshold: 0.2
+    warmup_steps: 5000
+    vanilla_probability: 0.7        # Higher for stability
+    gradient_accumulation_steps: 4
+```
+
+### When to Use
+
+- Simpler conceptual approach — fewer assumptions about 3D structure
+- Good for ablation: tests whether equivariance alone (without explicit multi-view reasoning) improves latent quality
+- Higher `vanilla_probability` (0.7) needed for training stability
+
+## Depth-Based Warp Computation
+
+### Overview
+
+`precompute_depth_warps.py` computes **geometrically exact** warp fields from CO3D ground-truth depth maps and camera poses, replacing the learned RoMA correspondences. This eliminates the noise from RoMA feature matching while producing warp files in the identical format, so `PrecomputedWarpDataset` can load them without modification.
+
+### Motivation
+
+RoMA warps are noisy — the learned feature matcher introduces correspondence errors that propagate into the warp consistency loss, especially for textureless or repetitive regions. Depth-based warps are:
+
+- **Geometrically exact**: Derived from actual 3D geometry, not learned features
+- **No GPU required**: Pure numpy computation (~10-24 pairs/sec on CPU)
+- **Better confidence**: Binary validity (depth exists + in-bounds + depth-consistent) instead of learned overlap probability
+- **Controllable pair selection**: Filter pairs by camera distance to prefer nearby viewpoints with less occlusion
+
+### Algorithm (per pixel)
+
+For each pixel `(u, v)` in source image A with depth `z_A`:
+
+```
+1. Unproject to camera-A 3D:    P_cam_A = K_A^{-1} · [u, v, 1]^T · z_A
+2. Transform to world frame:    P_world = (P_cam_A - T_A) · R_A^{-1}
+3. Transform to camera-B frame: P_cam_B = P_world · R_B + T_B
+4. Project to image B pixels:   [u_B, v_B, 1]^T = K_B · (P_cam_B / z_B)
+5. Normalize to [-1, 1]:        warp_x = u_B / W * 2 - 1  (for grid_sample)
+```
+
+**Confidence mask** is the AND of:
+- Source depth valid (`z_A > 0` and finite)
+- Reprojected point in front of camera B (`z_B > 0`)
+- Reprojected pixel in bounds of image B
+- Target depth valid at reprojected location (`z_B_actual > 0`)
+- Depth consistency: `|z_B_reproj - z_B_actual| / z_B_actual < threshold`
+
+### CO3D Camera Convention
+
+CO3D uses the **PyTorch3D NDC** coordinate system with right-multiply camera convention:
+
+```
+World-to-Camera:  X_cam = X_world @ R + T     (right-multiply)
+Camera position:  pos = -R^T @ T
+```
+
+**Intrinsics** use isotropic NDC (normalized by `half_min = min(W, H) / 2`):
+
+```
+NDC projection:    x_ndc = -f_x · X_cam / Z_cam + p_x
+NDC-to-screen:     u = -x_ndc · half_min + W/2
+                   v = -y_ndc · half_min + H/2
+
+Combining → pixel intrinsics:
+    f_x_px = f_x · half_min           c_x = -p_x · half_min + W/2
+    f_y_px = f_y · half_min           c_y = -p_y · half_min + H/2
+```
+
+> **Important**: Both `f_x` and `f_y` are scaled by `min(W, H)/2`, NOT by `W/2` and `H/2` separately. This is the isotropic NDC convention (`intrinsics_format: ndc_isotropic`).
+
+### CO3D Depth Format
+
+CO3D stores depth as **uint16 PNG files** encoding float16 values:
+
+```python
+depth = np.frombuffer(np.array(Image.open(path), dtype=np.uint16), dtype=np.float16)
+       .astype(np.float32).reshape((H, W))
+depth *= scale_adjustment  # usually 1.0
+```
+
+The depth maps cover the **entire scene** (96%+ valid pixels), not just the foreground object. The separate `depth_mask` files are foreground-only (~7% of pixels) and are NOT used for warp validity — we use `z > 0` instead.
+
+### Annotation Preprocessing
+
+`preprocess_co3d.py` was updated to include depth metadata in the `.jgz` annotations:
+
+```python
+# Fields added per frame:
+"depth_path": "category/seq/depths/frame000001.jpg.geometric.png"
+"depth_scale_adjustment": 1.0
+"depth_mask_path": "category/seq/depth_masks/frame000001.png"
+"image_size": [W, H]   # needed for intrinsic matrix construction
+```
+
+For the 4-category dataset, a combined annotation was created:
+
+```bash
+# Individual category annotations (from preprocess_co3d.py):
+data/co3d_annotations/{backpack,bench,car,toyplane}_{train,test}.jgz
+
+# Combined 4-category file (165 sequences, 16440 frames):
+data/co3d_annotations/4cat_train_depth.jgz
+```
+
+### Pair Selection
+
+Pairs are selected by **camera distance** (Euclidean distance between camera world positions). Default range `[0.05, 1.0]` prefers nearby viewpoints:
+
+- **Closer pairs** → less occlusion → higher warp confidence → cleaner training signal
+- **Min distance 0.05** → skip near-identical views (no useful geometric signal)
+- **3 pairs per frame** → sufficient coverage without explosion in pair count
+
+### Usage
+
+**Single category (hydrant):**
+```bash
+python precompute_depth_warps.py \
+    --annotation_file data/co3d_annotations/hydrant_train_50seq_depth.jgz \
+    --output_dir /visinf/projects_students/dlcv2025_groupZ/precomputed_warps/hydrant_depth_close \
+    --root_dir /visinf/projects_students/dlcv2025_groupZ/co3d_full \
+    --max_camera_distance 1.0 --min_camera_distance 0.05 \
+    --num_pairs_per_sample 3 --crop_images --warp_resolution 256
+```
+
+**4 categories (backpack, bench, car, toyplane):**
+```bash
+python precompute_depth_warps.py \
+    --annotation_file data/co3d_annotations/4cat_train_depth.jgz \
+    --output_dir /visinf/projects_students/dlcv2025_groupZ/precomputed_warps/4cat_depth_close \
+    --root_dir /visinf/projects_students/dlcv2025_groupZ/co3d \
+    --max_camera_distance 1.0 --min_camera_distance 0.05 \
+    --num_pairs_per_sample 3 --crop_images --warp_resolution 256
+```
+
+### Output Format
+
+Identical to `precompute_warps.py` — each pair saved as `warp_XXXXX_YYYYY.pt`:
+
+```python
+{
+    "warp_ab": Tensor[256, 256, 2],       # normalized [-1, 1] for grid_sample
+    "confidence_ab": Tensor[256, 256],    # binary {0, 1}
+    "warp_ba": Tensor[256, 256, 2],
+    "confidence_ba": Tensor[256, 256],
+}
+```
+
+Typical confidence: **56-64%** with cropping (background/occluded pixels filtered), **89-91%** without cropping. Cycle consistency median error: **0.025** in normalized coords (~1.6% of image width).
+
+### Configurations
+
+**Config:** `config/depth_warp_vae_hydrant.yaml` (single category)
+**Config:** `config/depth_warp_vae_4cat.yaml` (4 categories)
+
+Both use `WarpVAETrainer` with depth-warped data:
+
+```yaml
+trainer:
+  params:
+    warp_consistency_weight: 0.02
+    warp_reconstruction_weight: 0.02
+    warp_recon_pixel_weight: 0.0       # Perceptual-only reconstruction
+    warp_recon_perceptual_weight: 1.0
+    confidence_weighted: true
+
+data:
+  params:
+    dataset_config:
+      type: precomputed_warp
+      params:
+        confidence_threshold: 0.0      # Depth warps are binary, no thresholding needed
+        warp_dir: ".../4cat_depth_close"
+```
+
+### 4-Category Dataset Setup
+
+The 4-category dataset at `/visinf/projects_students/dlcv2025_groupZ/co3d` contains 48 sequences per category (backpack, bench, car, toyplane) downloaded from CO3Dv2. Setup steps:
+
+1. **Download** (already done via `scripts/download_co3d.sh`): images, depths, masks
+2. **Download annotations**: `frame_annotations.jgz` and `sequence_annotations.jgz` are inside the `_000.zip` file for each category — extract them to the category directory
+3. **Preprocess**: `python preprocess_co3d.py --category <cat> --co3d_v2_dir .../co3d --output_dir data/co3d_annotations`
+4. **Combine**: Merge per-category train annotations into `4cat_train_depth.jgz` (prefix sequence keys with category name to avoid collisions)
+5. **Precompute warps**: Run `precompute_depth_warps.py` on the combined file
+
+**Note**: `preprocess_co3d.py` skips frames whose masks aren't on disk, so it gracefully handles partial downloads (annotation files reference all sequences in the category, not just the 48 we downloaded).
+
+## Experiment Variants
+
+### Config Summary
+
+| Config | Trainer | Key Idea |
+|--------|---------|----------|
+| `warp_vae_hydrant_recon_crop` | `WarpVAETrainer` | Consistency + reconstruction loss (RoMA warps) |
+| `warp_vae_hydrant_recon_only` | `WarpVAETrainer` | Reconstruction loss only (ablation, `warp_consistency_weight: 0.0`) |
+| `naive_warp_vae_hydrant` | `NaiveWarpVAETrainer` | EQ-VAE-style equivariance |
+| `depth_warp_vae_hydrant` | `WarpVAETrainer` | Ground-truth depth-based warps (hydrant only) |
+| `depth_warp_vae_4cat` | `WarpVAETrainer` | Depth warps on 4 categories (backpack/bench/car/toyplane) |
+
+### Architecture Changes
+
+The `warp_vae_hydrant_recon_crop` config has been upscaled:
+- Image resolution: 128 → **256**
+- Channel width: 64 → **128** (doubled)
+- Channel multipliers: `[1, 2, 4]` → **`[1, 2, 4, 4]`** (added resolution level)
+- Batch size: 16 → **1** (per-GPU with gradient accumulation)
+
+## Model API Changes
+
+### `return_latent` Parameter
+
+`AutoencoderKL.forward()` now accepts `return_latent=True`:
+
+```python
+def forward(self, input, sample_posterior=True, return_latent=False):
+    # ...
+    if return_latent:
+        return dec, posterior, z   # z is the exact latent used for decoding
+    return dec, posterior
+```
+
+This ensures the warp consistency loss operates on the same `z` that was decoded, preventing double-sampling of the posterior which would break gradient consistency.
+
 ## File Summary
 
 | File | Purpose |
 |------|---------|
 | `src/data/warp_dataset.py` | `WarpCO3DDataset` (online) and `PrecomputedWarpDataset` |
-| `src/losses/warp_consistency.py` | `WarpConsistencyLoss`, `WarpReconstructionLoss`, `CycleConsistencyLoss` |
-| `src/trainer/vae_trainers.py` | `WarpVAETrainer` class with gradient accumulation |
+| `src/losses/warp_consistency.py` | `WarpConsistencyLoss`, `WarpReconstructionLoss`, `NaiveWarpConsistencyLoss`, `CycleConsistencyLoss` |
+| `src/trainer/vae_trainers.py` | `WarpVAETrainer` and `NaiveWarpVAETrainer` classes |
 | `ldm/modules/losses/contperceptual.py` | `LPIPSWithDiscriminator` with EMA-normalised adaptive weight |
+| `ldm/models/autoencoder.py` | `AutoencoderKL` with `return_latent` support |
 | `precompute_warps.py` | Multi-GPU script to precompute RoMaV2 warps |
-| `config/warp_vae_hydrant.yaml` | Primary config: warp-consistency only, hydrant, precomputed |
-| `config/warp_vae_hydrant_recon.yaml` | Variant: adds image-space warp reconstruction loss |
+| `precompute_depth_warps.py` | Depth-based warp precomputation from ground-truth geometry |
+| `config/warp_vae_hydrant_recon_crop.yaml` | Primary config: consistency + reconstruction, 256px |
+| `config/warp_vae_hydrant_recon_only.yaml` | Ablation: reconstruction loss only |
+| `config/naive_warp_vae_hydrant.yaml` | NaiveWarpVAETrainer (EQ-VAE-style equivariance) |
+| `config/depth_warp_vae_hydrant.yaml` | Depth-based warps (hydrant only) |
+| `config/depth_warp_vae_4cat.yaml` | Depth-based warps (4 categories) |
