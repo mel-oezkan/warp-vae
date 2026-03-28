@@ -260,7 +260,6 @@ During validation, EQ-VAE transformations are **disabled**. Standard forward pas
 
 ```yaml
 model:
-  base_learning_rate: 4.5e-6
   target: ldm.models.autoencoder.EQVAEAutoencoder
   params:
     embed_dim: 4
