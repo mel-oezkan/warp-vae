@@ -8,7 +8,6 @@ Visualizes:
     - show original latent channels mean
     - show PCA-reduced latent channels
 
-
 Usage:
     python evaluation/visualize_latents.py \
         --checkpoint outputs/warp_vae/checkpoints/last.ckpt \

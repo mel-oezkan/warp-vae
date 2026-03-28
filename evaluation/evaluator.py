@@ -1,5 +1,8 @@
 """
-Main evaluator class for EQVAE model validation.
+Generic VAE evaluator supporting all model variants.
+
+Computes g-FID, s-FID, LPIPS, MSE, PSNR, SSIM for one or more models,
+and produces a comparison table + per-model JSON results.
 """
 
 import torch
@@ -7,450 +10,251 @@ import yaml
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from tqdm import tqdm
 
-from ldm.util import instantiate_from_config
+from evaluation.model_wrapper import VAEModelWrapper, _resolve_hydra_refs
 from src.data.datamodule import VAEDataModule
 
 
-class EQVAEEvaluator:
+class VAEEvaluator:
     """
-    Comprehensive evaluator for trained EQVAE models.
+    Model-agnostic evaluator for all VAE variants.
 
-    Handles checkpoint loading, metric computation, visualization generation,
-    and report creation.
+    Supports comparing multiple models on the same dataset.
     """
 
     def __init__(
         self,
-        checkpoint_path: str,
-        config_path: str,
         output_dir: str,
         device: str = 'cuda',
-        use_ema: bool = True,
         batch_size: int = 8,
         num_workers: int = 4,
+        num_fid_samples: int = 5000,
+        num_lpips_samples: Optional[int] = None,
+        num_recon_samples: Optional[int] = None,
         seed: int = 42,
     ):
-        """
-        Initialize EQVAE evaluator.
-
-        Args:
-            checkpoint_path: Path to model checkpoint
-            config_path: Path to model config YAML
-            output_dir: Directory to save outputs
-            device: Device to run evaluation on
-            use_ema: Whether to use EMA weights
-            batch_size: Batch size for evaluation
-            num_workers: Number of dataloader workers
-            seed: Random seed for reproducibility
-        """
-        self.checkpoint_path = Path(checkpoint_path)
-        self.config_path = Path(config_path)
         self.output_dir = Path(output_dir)
         self.device = device
-        self.use_ema = use_ema
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.num_fid_samples = num_fid_samples
+        self.num_lpips_samples = num_lpips_samples
+        self.num_recon_samples = num_recon_samples
         self.seed = seed
 
-        # Create output directories
-        self.metrics_dir = self.output_dir / "metrics"
-        self.figures_dir = self.output_dir / "figures"
-        self.reports_dir = self.output_dir / "reports"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        for dir_path in [self.metrics_dir, self.figures_dir, self.reports_dir]:
-            dir_path.mkdir(parents=True, exist_ok=True)
-
-        # Set random seed
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
 
-        # Initialize components
-        self.model = None
-        self.datamodule = None
-        self.config = None
+    def setup_dataloader(self, config_path: str):
+        """Setup validation dataloader from a config file."""
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        config = _resolve_hydra_refs(config)
 
-        print("[EQVAEEvaluator] Initialized")
-        print(f"  Checkpoint: {self.checkpoint_path}")
-        print(f"  Config: {self.config_path}")
-        print(f"  Output: {self.output_dir}")
-        print(f"  Device: {self.device}")
-        print(f"  Use EMA: {self.use_ema}")
+        data_config = config.get('data', {})
 
-    def load_checkpoint(self):
-        """Load EQVAE model from checkpoint."""
-        print("\n" + "="*60)
-        print("Loading Checkpoint")
-        print("="*60)
-
-        # Load config
-        with open(self.config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
-        print("✓ Config loaded")
-
-        # Instantiate model from config
-        model = instantiate_from_config(self.config['model'])
-        print(f"✓ Model instantiated: {self.config['model']['target']}")
-
-        # Load checkpoint
-        print(f"Loading checkpoint: {self.checkpoint_path}")
-        ckpt = torch.load(self.checkpoint_path, map_location='cpu')
-
-        # Extract state dict (handle different checkpoint formats)
-        if 'state_dict' in ckpt:
-            state_dict = ckpt['state_dict']
+        # Handle both our custom config format and the old LDM format
+        if 'params' in data_config and 'dataset_config' in data_config.get('params', {}):
+            datamodule = VAEDataModule(
+                dataset_config=data_config['params']['dataset_config'],
+                batch_size=self.batch_size,
+                val_split=data_config['params'].get('val_split', 0.1),
+                num_workers=self.num_workers,
+                pin_memory=True,
+                persistent_workers=self.num_workers > 0,
+                seed=self.seed,
+            )
+            datamodule.setup('fit')
+            return datamodule.val_dataloader()
         else:
-            state_dict = ckpt
+            raise ValueError(
+                f"Unsupported data config format in {config_path}. "
+                "Expected data.params.dataset_config."
+            )
 
-        # Remove 'model.' prefix if present
-        model_state_dict = {}
-        for k, v in state_dict.items():
-            if k.startswith('model.'):
-                model_state_dict[k[6:]] = v
-            else:
-                model_state_dict[k] = v
-
-        # Load state dict
-        missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
-        if missing_keys:
-            print(f"  Warning: Missing keys: {len(missing_keys)}")
-        if unexpected_keys:
-            print(f"  Warning: Unexpected keys: {len(unexpected_keys)}")
-
-        print("✓ Checkpoint loaded")
-
-        # Move to device and set to eval mode
-        model = model.to(self.device)
-        model.eval()
-
-        # Use EMA weights if available
-        if self.use_ema and hasattr(model, 'model_ema') and model.model_ema is not None:
-            print("✓ Using EMA weights")
-            self.model = model
-            self._ema_mode = True
-        else:
-            self.model = model
-            self._ema_mode = False
-
-        print(f"✓ Model ready on {self.device}")
-
-        # Extract epoch from checkpoint if available
-        self.epoch = ckpt.get('epoch', 'unknown')
-        print(f"✓ Epoch: {self.epoch}")
-
-        return self.model
-
-    def setup_dataloader(self, split='val', sample_mode='single'):
-        """
-        Setup dataloader for evaluation.
+    def evaluate_model(
+        self,
+        wrapper: VAEModelWrapper,
+        val_loader,
+        model_name: str,
+        metrics_to_compute: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate a single model.
 
         Args:
-            split: Dataset split ('val' or 'test')
-            sample_mode: Sampling mode ('single' or 'pairs')
-        """
-        print("\n" + "="*60)
-        print("Setting up Dataloader")
-        print("="*60)
-
-        # Get dataset config from model config
-        data_config = self.config.get('data', {})
-
-        # Create datamodule
-        self.datamodule = VAEDataModule(
-            dataset_config=data_config['params']['dataset_config'],
-            batch_size=self.batch_size,
-            val_split=data_config['params'].get('val_split', 0.1),
-            num_workers=self.num_workers,
-            pin_memory=True,
-            persistent_workers=self.num_workers > 0,
-            seed=self.seed,
-        )
-
-        # Setup
-        self.datamodule.setup('fit')
-
-        # Get dataloader
-        if split == 'val':
-            self.val_loader = self.datamodule.val_dataloader()
-            print("✓ Validation dataloader ready")
-            print(f"  Validation samples: {len(self.datamodule.val_dataset)}")
-            print(f"  Batches: {len(self.val_loader)}")
-            print(f"  Batch size: {self.batch_size}")
-            return self.val_loader
-        else:
-            raise NotImplementedError(f"Split '{split}' not implemented")
-
-    def compute_all_metrics(self) -> Dict[str, Any]:
-        """
-        Compute all metrics.
+            wrapper: VAEModelWrapper instance
+            val_loader: Validation dataloader
+            model_name: Display name for this model
+            metrics_to_compute: List of metrics to compute.
+                Options: 'reconstruction', 'lpips', 'fid'. Default: all.
 
         Returns:
             Dictionary with all computed metrics
         """
-        print("\n" + "="*60)
-        print("Computing Metrics")
-        print("="*60)
+        if metrics_to_compute is None:
+            metrics_to_compute = ['reconstruction', 'lpips', 'fid']
 
-        metrics = {
-            'checkpoint': str(self.checkpoint_path),
-            'epoch': self.epoch,
+        print(f"\n{'='*60}")
+        print(f"  Evaluating: {model_name} ({wrapper.name})")
+        print(f"{'='*60}")
+
+        reconstruct_fn = lambda model, imgs: wrapper.reconstruct(imgs)
+        results = {
+            'model_name': model_name,
+            'model_class': wrapper.name,
+            'model_type': wrapper.model_type,
             'timestamp': datetime.now().isoformat(),
-            'use_ema': self.use_ema,
         }
 
-        # Import metrics modules
-        from evaluation.metrics import (
-            ReconstructionMetrics,
-            LPIPSCalculator,
-            EquivarianceMetrics,
-            FIDCalculator,
-        )
+        if 'reconstruction' in metrics_to_compute:
+            print("\n[1/3] Reconstruction metrics (MSE, PSNR, SSIM)...")
+            from evaluation.metrics import ReconstructionMetrics
+            recon_calc = ReconstructionMetrics(
+                device=self.device, reconstruct_fn=reconstruct_fn,
+            )
+            results['reconstruction'] = recon_calc.compute(
+                val_loader, wrapper.model, num_samples=self.num_recon_samples,
+            )
 
-        # Compute reconstruction metrics
-        print("\n1. Reconstruction Metrics...")
-        recon_metrics = ReconstructionMetrics(self.model, self.device)
-        metrics['reconstruction_quality'] = recon_metrics.compute(self.val_loader)
+        if 'lpips' in metrics_to_compute:
+            print("\n[2/3] LPIPS...")
+            from evaluation.metrics import LPIPSCalculator
+            lpips_calc = LPIPSCalculator(
+                device=self.device, reconstruct_fn=reconstruct_fn,
+            )
+            results['lpips'] = lpips_calc.compute(
+                val_loader, wrapper.model, num_samples=self.num_lpips_samples,
+            )
 
-        # Compute LPIPS
-        print("\n2. LPIPS Perceptual Similarity...")
-        lpips_calc = LPIPSCalculator(self.model)
-        metrics['lpips'] = lpips_calc.compute(self.val_loader)
+        if 'fid' in metrics_to_compute:
+            print("\n[3/3] g-FID & s-FID...")
+            from evaluation.metrics import FIDCalculator
+            fid_calc = FIDCalculator(
+                device=self.device, reconstruct_fn=reconstruct_fn,
+            )
+            results['fid'] = fid_calc.compute(
+                val_loader, wrapper.model, num_samples=self.num_fid_samples,
+            )
 
-        # Compute equivariance metrics
-        print("\n3. Equivariance Properties...")
-        equiv_metrics = EquivarianceMetrics(self.model, self.device)
-        metrics['equivariance'] = equiv_metrics.compute(self.val_loader, num_samples=500)
+        return results
 
-        # Compute FID (optional, can be slow)
-        print("\n4. FID Score...")
-        try:
-            fid_calc = FIDCalculator(device=self.device)
-            metrics['fid'] = fid_calc.compute_fid(self.val_loader, self.model, num_samples=5000)
-        except Exception as e:
-            print(f"  Warning: FID computation failed: {e}")
-            metrics['fid'] = None
-
-        # Compute latent space statistics
-        print("\n5. Latent Space Statistics...")
-        metrics['latent_space'] = self._compute_latent_stats()
-
-        print("\n✓ All metrics computed")
-        return metrics
-
-    def _compute_latent_stats(self) -> Dict[str, Any]:
-        """Compute latent space statistics."""
-        latents = []
-
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(self.val_loader, desc="Extracting latents")):
-                if batch_idx >= 200:  # Limit to 200 batches for speed
-                    break
-
-                images = batch['image'].to(self.device)
-
-                # Encode
-                if self._ema_mode and hasattr(self.model, 'ema_scope'):
-                    with self.model.ema_scope():
-                        posterior = self.model.encode(images)
-                else:
-                    posterior = self.model.encode(images)
-
-                z = posterior.sample()
-
-                # Flatten spatial dimensions and collect
-                z_flat = z.view(z.size(0), z.size(1), -1).mean(dim=2)  # [B, C]
-                latents.append(z_flat.cpu())
-
-        latents = torch.cat(latents, dim=0)  # [N, C]
-
-        # Compute statistics
-        stats = {
-            'mean': latents.mean(dim=0).tolist(),
-            'std': latents.std(dim=0).tolist(),
-            'min': latents.min(dim=0).values.tolist(),
-            'max': latents.max(dim=0).values.tolist(),
-        }
-
-        # KL divergence from N(0,1)
-        kl_div = 0.5 * torch.sum(
-            latents.mean(dim=0)**2 + latents.std(dim=0)**2 - 1 - torch.log(latents.std(dim=0)**2)
-        ).item()
-        stats['kl_divergence'] = kl_div
-
-        # Sparsity
-        sparsity = (torch.abs(latents) < 0.1).float().mean().item()
-        stats['sparsity_ratio'] = sparsity
-
-        return stats
-
-    def generate_all_visualizations(self, metrics: Dict[str, Any]):
-        """
-        Generate all visualizations.
+    def compare_models(
+        self,
+        checkpoints: List[str],
+        configs: List[str],
+        model_names: Optional[List[str]] = None,
+        data_config: Optional[str] = None,
+        metrics_to_compute: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Evaluate and compare multiple models.
 
         Args:
-            metrics: Computed metrics dictionary
+            checkpoints: List of checkpoint paths
+            configs: List of config paths (one per checkpoint, or one shared)
+            model_names: Display names (defaults to checkpoint filenames)
+            data_config: Config to use for dataloader setup.
+                        Defaults to first config in configs list.
+            metrics_to_compute: Which metrics to compute
+
+        Returns:
+            Combined results dict with per-model metrics and comparison table
         """
-        print("\n" + "="*60)
-        print("Generating Visualizations")
-        print("="*60)
+        assert len(checkpoints) > 0, "Need at least one checkpoint"
+        if len(configs) == 1 and len(checkpoints) > 1:
+            configs = configs * len(checkpoints)
+        assert len(configs) == len(checkpoints), \
+            f"Need one config per checkpoint (got {len(configs)} configs, {len(checkpoints)} checkpoints)"
 
-        from evaluation.visualizers import (
-            ReconstructionVisualizer,
-            LatentVisualizer,
-            EquivarianceVisualizer,
-            MultiViewVisualizer,
-        )
+        if model_names is None:
+            model_names = [Path(c).parent.name for c in checkpoints]
 
-        # 1. Reconstruction grid
-        print("\n1. Reconstruction Grid...")
-        recon_viz = ReconstructionVisualizer(self.model, self.device)
-        recon_viz.create_reconstruction_grid(
-            self.val_loader,
-            num_samples=16,
-            save_path=self.figures_dir / "reconstruction_grid"
-        )
+        # Setup dataloader (use data_config or first config)
+        loader_config = data_config or configs[0]
+        print(f"Setting up dataloader from: {Path(loader_config).name}")
+        val_loader = self.setup_dataloader(loader_config)
 
-        # 2. Equivariance tests
-        print("\n2. Equivariance Tests...")
-        equiv_viz = EquivarianceVisualizer(self.model, self.device)
-        equiv_viz.visualize_transformation_tests(
-            self.val_loader,
-            num_samples=6,
-            save_path=self.figures_dir / "equivariance_tests"
-        )
+        all_results = {}
+        for ckpt, cfg, name in zip(checkpoints, configs, model_names):
+            wrapper = VAEModelWrapper.from_config(cfg, ckpt, self.device)
+            results = self.evaluate_model(wrapper, val_loader, name, metrics_to_compute)
+            all_results[name] = results
 
-        # 3. Latent space visualizations
-        print("\n3. Latent Space Visualizations...")
-        latent_viz = LatentVisualizer(self.model, self.device)
+            # Save per-model results
+            safe_name = name.replace(" ", "_").replace("/", "_")
+            model_path = self.output_dir / f"{safe_name}_metrics.json"
+            with open(model_path, 'w') as f:
+                json.dump(results, f, indent=2)
 
-        # t-SNE
-        latent_viz.visualize_latent_tsne(
-            self.val_loader,
-            num_samples=2000,
-            save_path=self.figures_dir / "latent_tsne"
-        )
+            # Free GPU memory
+            del wrapper
+            torch.cuda.empty_cache()
 
-        # Distributions
-        latent_viz.visualize_latent_distributions(
-            self.val_loader,
-            num_samples=2000,
-            save_path=self.figures_dir / "latent_distributions"
-        )
+        # Build and save comparison
+        comparison = self._build_comparison_table(all_results)
+        all_results['_comparison'] = comparison
 
-        # Interpolations
-        latent_viz.visualize_interpolations(
-            self.val_loader,
-            num_pairs=4,
-            num_steps=10,
-            save_path=self.figures_dir / "interpolations"
-        )
+        # Save combined results
+        combined_path = self.output_dir / "comparison.json"
+        with open(combined_path, 'w') as f:
+            json.dump(all_results, f, indent=2)
 
-        # 4. Multi-view consistency
-        print("\n4. Multi-View Consistency...")
-        try:
-            multiview_viz = MultiViewVisualizer(self.model, self.device)
-            multiview_viz.visualize_24_view_consistency(
-                self.val_loader,
-                save_path=self.figures_dir / "multiview_consistency"
-            )
-        except Exception as e:
-            print(f"  Warning: Multi-view visualization failed: {e}")
+        # Print comparison table
+        self._print_comparison(comparison)
 
-        print("\n✓ All visualizations generated")
+        return all_results
 
-    def save_metrics(self, metrics: Dict[str, Any]):
-        """Save metrics to JSON file."""
-        metrics_path = self.metrics_dir / f"eqvae_epoch{self.epoch}_metrics.json"
-        with open(metrics_path, 'w') as f:
-            json.dump(metrics, f, indent=2)
-        print(f"\n✓ Metrics saved to: {metrics_path}")
+    def _build_comparison_table(self, all_results: Dict) -> Dict:
+        """Build a flat comparison table from per-model results."""
+        rows = []
+        for name, res in all_results.items():
+            row = {'model': name}
+            if 'reconstruction' in res:
+                row.update({
+                    'MSE': res['reconstruction']['mse'],
+                    'PSNR': res['reconstruction']['psnr'],
+                    'SSIM': res['reconstruction']['ssim'],
+                })
+            if 'lpips' in res:
+                row['LPIPS'] = res['lpips']['mean']
+            if 'fid' in res:
+                row['g-FID'] = res['fid']['g_fid']
+                row['s-FID'] = res['fid']['s_fid']
+            rows.append(row)
+        return rows
 
-    def generate_report(self, metrics: Dict[str, Any]):
-        """Generate markdown report."""
-        report_path = self.reports_dir / "validation_report.md"
+    def _print_comparison(self, comparison: List[Dict]):
+        """Pretty-print comparison table."""
+        if not comparison:
+            return
 
-        with open(report_path, 'w') as f:
-            f.write("# EQVAE Validation Report\n\n")
-            f.write(f"**Date:** {metrics['timestamp']}\n\n")
-            f.write(f"**Checkpoint:** `{metrics['checkpoint']}`\n\n")
-            f.write(f"**Epoch:** {metrics['epoch']}\n\n")
-            f.write(f"**Use EMA:** {metrics['use_ema']}\n\n")
-            f.write("---\n\n")
+        print(f"\n{'='*80}")
+        print("  COMPARISON TABLE")
+        print(f"{'='*80}")
 
-            # Reconstruction quality
-            f.write("## Reconstruction Quality\n\n")
-            if 'reconstruction_quality' in metrics:
-                for k, v in metrics['reconstruction_quality'].items():
-                    f.write(f"- **{k.upper()}:** {v:.4f}\n")
-            f.write("\n")
+        # Collect all metric keys
+        metric_keys = [k for k in comparison[0].keys() if k != 'model']
+        header = f"{'Model':<25}"
+        for k in metric_keys:
+            header += f" {k:>10}"
+        print(header)
+        print("-" * len(header))
 
-            # LPIPS
-            if 'lpips' in metrics and metrics['lpips']:
-                f.write("## LPIPS Perceptual Similarity\n\n")
-                f.write(f"- **Mean:** {metrics['lpips']['mean']:.4f}\n")
-                f.write(f"- **Std:** {metrics['lpips']['std']:.4f}\n")
-                f.write("\n")
+        for row in comparison:
+            line = f"{row['model']:<25}"
+            for k in metric_keys:
+                val = row.get(k)
+                if val is None:
+                    line += f" {'N/A':>10}"
+                elif isinstance(val, float):
+                    line += f" {val:>10.4f}"
+                else:
+                    line += f" {str(val):>10}"
+            print(line)
 
-            # FID
-            if 'fid' in metrics and metrics['fid'] is not None:
-                f.write("## FID Score\n\n")
-                f.write(f"- **FID:** {metrics['fid']:.2f}\n")
-                f.write("\n")
-
-            # Equivariance
-            if 'equivariance' in metrics:
-                f.write("## Equivariance Properties\n\n")
-                f.write(f"```json\n{json.dumps(metrics['equivariance'], indent=2)}\n```\n\n")
-
-            # Latent space
-            if 'latent_space' in metrics:
-                f.write("## Latent Space Statistics\n\n")
-                f.write(f"- **KL Divergence:** {metrics['latent_space']['kl_divergence']:.4f}\n")
-                f.write(f"- **Sparsity Ratio:** {metrics['latent_space']['sparsity_ratio']:.4f}\n")
-                f.write("\n")
-
-            # Figures
-            f.write("## Figures\n\n")
-            f.write("- [Reconstruction Grid](../figures/reconstruction_grid.pdf)\n")
-            f.write("- [Equivariance Tests](../figures/equivariance_tests.pdf)\n")
-            f.write("- [Latent t-SNE](../figures/latent_tsne.pdf)\n")
-            f.write("- [Latent Distributions](../figures/latent_distributions.pdf)\n")
-            f.write("- [Interpolations](../figures/interpolations.pdf)\n")
-            f.write("- [Multi-View Consistency](../figures/multiview_consistency.pdf)\n")
-
-        print(f"✓ Report saved to: {report_path}")
-
-    def run_full_evaluation(self):
-        """Run complete evaluation pipeline."""
-        print("\n" + "="*70)
-        print(" "*20 + "EQVAE MODEL VALIDATION")
-        print("="*70)
-
-        # Load checkpoint
-        self.load_checkpoint()
-
-        # Setup dataloader
-        self.setup_dataloader()
-
-        # Compute metrics
-        metrics = self.compute_all_metrics()
-
-        # Save metrics
-        self.save_metrics(metrics)
-
-        # Generate visualizations
-        self.generate_all_visualizations(metrics)
-
-        # Generate report
-        self.generate_report(metrics)
-
-        print("\n" + "="*70)
-        print(" "*25 + "EVALUATION COMPLETE!")
-        print("="*70)
-        print(f"\nResults saved to: {self.output_dir}")
-        print(f"  - Metrics: {self.metrics_dir}")
-        print(f"  - Figures: {self.figures_dir}")
-        print(f"  - Report: {self.reports_dir}")
+        print(f"{'='*80}")
+        print(f"Results saved to: {self.output_dir}")
