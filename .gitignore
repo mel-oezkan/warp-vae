@@ -44,3 +44,4 @@ evaluation/notebooks/*
 eval_outputs/
 tests/*
 docs/report/
+kaggle_build/*
