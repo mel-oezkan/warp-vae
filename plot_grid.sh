@@ -29,5 +29,7 @@ python scripts/visualize_latent_pca_grid.py \
     --categories hydrant\
     --seed 101 \
     --num_objects 1 \
-    --views_per_object 5\
-    --output eval_outputs/comparison_view.png
+    --views_per_object 5 \
+    --view_sampling consecutive \
+    --view_stride 5 \
+    --output eval_outputs/comparison_view2.png

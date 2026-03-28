@@ -49,6 +49,25 @@ def main():
                         help="Number of views per object to show")
     parser.add_argument("--view_index", type=int, default=0,
                         help="Which view index to use (when views_per_object=1)")
+    parser.add_argument(
+        "--view_sampling", type=str, default="linspace",
+        choices=["linspace", "consecutive"],
+        help=(
+            "How to choose views when views_per_object>1: "
+            "'linspace' spreads across sequence, 'consecutive' picks nearby frames"
+        ),
+    )
+    parser.add_argument(
+        "--view_stride", type=int, default=1,
+        help="Stride between selected views for consecutive sampling",
+    )
+    parser.add_argument(
+        "--start_view", type=int, default=None,
+        help=(
+            "Starting view index for consecutive sampling; "
+            "defaults to centered window when not provided"
+        ),
+    )
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--categories", nargs="+", default=None,
                         help="Filter to specific CO3D categories (e.g., hydrant chair car)")
@@ -64,6 +83,9 @@ def main():
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+
+    if args.view_stride < 1:
+        raise ValueError("--view_stride must be >= 1")
 
     transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size)),
@@ -93,7 +115,7 @@ def main():
 
     n_models = len(args.checkpoints)
     n_views = args.views_per_object
-    model_names = list(args.model_names)
+    model_names = list(args.model_names)[:n_models]
 
     # Pre-load images (no GPU needed for this beyond the transform)
     print("\nLoading images...")
@@ -104,12 +126,31 @@ def main():
         if n_views == 1:
             view_indices = [min(args.view_index, num_available - 1)]
         else:
-            view_indices = np.linspace(0, num_available - 1, n_views, dtype=int).tolist()
+            if args.view_sampling == "linspace":
+                view_indices = np.linspace(0, num_available - 1, n_views, dtype=int).tolist()
+            else:
+                span = (n_views - 1) * args.view_stride + 1
+                if num_available <= span:
+                    # Sequence too short: keep as close as possible and clip to last frame.
+                    view_indices = [
+                        min(i * args.view_stride, num_available - 1)
+                        for i in range(n_views)
+                    ]
+                else:
+                    max_start = num_available - span
+                    if args.start_view is None:
+                        start = max_start // 2
+                    else:
+                        start = int(np.clip(args.start_view, 0, max_start))
+                    view_indices = [start + i * args.view_stride for i in range(n_views)]
         view_indices_per_obj.append(view_indices)
         for view_idx in view_indices:
             img = adapter.load_view_image(obj_id, view_idx, transform, device)
             all_images[obj_idx].append(img)
-        print(f"  [{obj_idx+1}/{n_objects}] {adapter.get_object_name(obj_id)}: {len(view_indices)} views")
+        print(
+            f"  [{obj_idx+1}/{n_objects}] {adapter.get_object_name(obj_id)}: "
+            f"{len(view_indices)} views (indices={view_indices})"
+        )
 
     # Encode latents one model at a time to save GPU memory
     print("\nEncoding latents (sequential per model)...")
@@ -144,31 +185,33 @@ def main():
                 cs = F.cosine_similarity(flat_a.unsqueeze(0), flat_b.unsqueeze(0)).item()
                 cos_sims[m_idx][obj_idx].append(cs)
 
-    # Fit global PCA (1 component) across all latents for fair comparison
-    print("\nFitting global PCA...")
-    all_flat = []
+    # Fit per-model PCA (1 component) so each model is normalized independently
+    print("\nFitting per-model PCA...")
+    pca_models = []
+    per_model_ranges = []
     for m_idx in range(n_models):
+        model_flat = []
         for obj_idx in range(n_objects):
             for lat in all_latents[m_idx][obj_idx]:
                 l = lat[0].cpu().numpy()
                 C, H, W = l.shape
-                all_flat.append(l.reshape(C, -1).T)
-    all_flat = np.vstack(all_flat)
-    pca_model = PCA(n_components=1)
-    pca_model.fit(all_flat)
+                model_flat.append(l.reshape(C, -1).T)
+        model_flat = np.vstack(model_flat)
+        pca_m = PCA(n_components=1)
+        pca_m.fit(model_flat)
+        pc1 = pca_m.transform(model_flat)[:, 0]
+        vmin, vmax = np.percentile(pc1, [2, 98])
+        pca_models.append(pca_m)
+        per_model_ranges.append((vmin, vmax))
 
-    # Compute global PC1 range for consistent colormap
-    all_pc1 = pca_model.transform(all_flat)[:, 0]
-    global_vmin, global_vmax = np.percentile(all_pc1, [2, 98])
-
-    # Helper: apply PCA + ocean colormap
-    def latent_to_pca_ocean(latent, pca_m, vmin, vmax):
+    # Helper: apply PCA, return grayscale PC1 map
+    def latent_to_pca_map(latent, pca_m, vmin, vmax):
         lat = latent[0] if latent.dim() == 4 else latent
         C, H, W = lat.shape
         lat_flat = lat.cpu().numpy().reshape(C, -1).T
         pc1 = pca_m.transform(lat_flat)[:, 0].reshape(H, W)
         pc1_norm = np.clip((pc1 - vmin) / (vmax - vmin + 1e-8), 0, 1)
-        return plt.cm.ocean(pc1_norm)[..., :3]
+        return pc1_norm
 
     # Create figure
     n_cols = n_objects * n_views
@@ -192,22 +235,15 @@ def main():
                 axes[0, col].set_title(category, fontsize=14, fontweight="bold")
             axes[0, col].axis("off")
 
-            # Rows 1..n_models: PCA latents (ocean colormap, globally normalized)
+            # Rows 1..n_models: PCA latents (per-model normalization)
             for m_idx in range(n_models):
-                lat_rgb = latent_to_pca_ocean(
-                    all_latents[m_idx][obj_idx][v_idx], pca_model,
-                    global_vmin, global_vmax,
+                vmin, vmax = per_model_ranges[m_idx]
+                lat_map = latent_to_pca_map(
+                    all_latents[m_idx][obj_idx][v_idx], pca_models[m_idx],
+                    vmin, vmax,
                 )
-                axes[1 + m_idx, col].imshow(lat_rgb)
+                axes[1 + m_idx, col].imshow(lat_map, cmap="Spectral")
                 axes[1 + m_idx, col].axis("off")
-
-                # Annotate cosine similarity to the *previous* view
-                if v_idx > 0:
-                    cs = cos_sims[m_idx][obj_idx][v_idx - 1]
-                    axes[1 + m_idx, col].set_title(
-                        f"{cs:.3f}", fontsize=9, color="white",
-                        backgroundcolor=(0, 0, 0, 0.6), pad=2,
-                    )
 
     plt.tight_layout(rect=[0.08, 0, 1, 1])  # leave space on left for labels
 
@@ -218,20 +254,6 @@ def main():
             bbox.x0 - 0.01, (bbox.y0 + bbox.y1) / 2, label,
             fontsize=14, fontweight="bold", ha="right", va="center", rotation=90
         )
-
-    # Add mean MLC score per model as annotation on the right side
-    for m_idx in range(n_models):
-        all_cs = [cs for obj_idx in range(n_objects) for cs in cos_sims[m_idx][obj_idx]]
-        if all_cs:
-            mean_cs = np.mean(all_cs)
-            row = 1 + m_idx
-            bbox = axes[row, -1].get_position()
-            fig.text(
-                bbox.x1 + 0.01, (bbox.y0 + bbox.y1) / 2,
-                f"avg: {mean_cs:.3f}",
-                fontsize=12, fontweight="bold", ha="left", va="center",
-                color="black",
-            )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
