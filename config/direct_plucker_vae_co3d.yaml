@@ -5,7 +5,6 @@
 # Decoder outputs both image and Plucker reconstruction.
 
 model:
-  base_learning_rate: 4.5e-6
   target: ldm.models.autoencoder.DirectPluckerVAE
   params:
     embed_dim: 4

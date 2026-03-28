@@ -1,0 +1,52 @@
+# Evaluation config for ImageNet-128x128-10k (10k image subset, resized to 128)
+
+model:
+  target: ldm.models.autoencoder.AutoencoderKL
+  params:
+    embed_dim: 4
+    monitor: "val/rec_loss"
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 50001
+        kl_weight: 0.000001
+        disc_weight: 0.5
+
+    ddconfig:
+      double_z: True
+      z_channels: 4
+      resolution: 128
+      in_channels: 3
+      out_ch: 3
+      ch: 64
+      ch_mult: [1, 2, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+data:
+  target: src.data.datamodule.VAEDataModule
+  params:
+    dataset_config:
+      type: imagenet
+      params:
+        root_dir: "/visinf/projects_students/dlcv2025_groupZ/imagenet-256-10k"
+        image_size: 128
+    batch_size: 8
+    val_split: 0.99  # Use 99% as validation
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    shuffle_train: false
+
+training:
+  batch_size: 8
+  image_size: 128
+  num_workers: 4
+  val_split: 0.99
+  num_epochs: 1
+  lr: 4.5e-6
+  kl_weight: 0.000001
+  lpips_loss_weight: 1.0
+  ema_decay: 0.9999
+  precision: 32

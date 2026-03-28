@@ -1,7 +1,7 @@
 # WARP-VAE training on CO3D hydrant with precomputed warps
-# From scratch with warp consistency + WarpReconstructionLoss enabled
+# Variant D: Lower warp weights + vanilla_prob=0.3 to prioritize reconstruction
 #
-# Run: CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_hydrant_recon
+# Run: CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_hydrant_recon_small_d
 
 model:
   target: ldm.models.autoencoder.AutoencoderKL
@@ -16,8 +16,8 @@ model:
       resolution: ${training.image_size}
       in_channels: 3
       out_ch: 3
-      ch: 128
-      ch_mult: [1, 2, 4, 4]
+      ch: 64
+      ch_mult: [1, 2, 4]
       num_res_blocks: 2
       attn_resolutions: []
       dropout: 0.0
@@ -30,15 +30,15 @@ model:
         disc_weight: 0.5
         perceptual_weight: ${training.lpips_loss_weight}
         disc_in_channels: 3
-        disc_num_layers: 3
+        disc_num_layers: 2
         use_actnorm: false
 
 trainer:
   target: src.trainer.vae_trainers.WarpVAETrainer
   params:
     target_key: "image_target"
-    warp_consistency_weight: 0.1
-    warp_reconstruction_weight: 0.1
+    warp_consistency_weight: 0.05
+    warp_reconstruction_weight: 0.05
     warp_recon_pixel_weight: 0.0
     warp_recon_perceptual_weight: 1.0
     consistency_loss_type: "l1"
@@ -46,7 +46,7 @@ trainer:
     confidence_weighted: true
     loss_confidence_threshold: 0.2
     warmup_steps: 5000
-    vanilla_probability: 0
+    vanilla_probability: 0.3
     gradient_accumulation_steps: ${training.gradient_accumulation_steps}
 
 data:
@@ -70,25 +70,25 @@ data:
     prefetch_factor: 4
 
 training:
-  batch_size: 2
-  image_size: 256
+  batch_size: 18
+  image_size: 128
   num_workers: 4
   val_split: 0.2
-  num_epochs: 20
-  lr: 1.0e-5
-  kl_weight: 0.00001
+  num_epochs: 30
+  lr: 4.5e-6
+  kl_weight: 0.000001
   lpips_loss_weight: 1.0
   ema_decay: 0.9999
   precision: 32
-  output_dir: "./outputs/warp_vae_hydrant_recon"
+  output_dir: "./outputs/warp_vae_hydrant_recon_small_d"
   checkpoint_every_n_epochs: 5
   checkpoint_every_n_steps: 5000
   log_every_n_steps: 50
   gradient_accumulation_steps: 4
-  note: "hydrant 50seq nocrop, from scratch, warp_w=1, warp_recon_w=1, disc_w=0.5, disc_start=15k"
+  note: "Run D: warp=0.05, vanilla_prob=0.3, full hydrant data"
 
 wandb:
   enabled: true
   project: enhanced-VAE
   entity: deep_cv
-  tags: ["warp-vae", "precomputed", "co3d", "hydrant", "warp-reconstruction"]
+  tags: ["warp-vae", "precomputed", "co3d", "hydrant", "small-model", "run-d"]

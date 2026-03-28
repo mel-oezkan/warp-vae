@@ -5,7 +5,6 @@
 # No encoder-side Plucker prediction - purely tests conditioning effect.
 
 model:
-  base_learning_rate: 4.5e-6
   target: ldm.models.autoencoder.PluckerConditionedVAE
   params:
     embed_dim: 4
