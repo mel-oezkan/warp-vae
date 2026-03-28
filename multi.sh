@@ -53,7 +53,7 @@ python scripts/analyze_multiview_latent_consistency.py \
     --checkpoints \
         "checkpoints/accurate-courageous-agama-of-authority_EQ-VAE on CO3D hydrant 50seq, step-matched to Warp VAE e4ksa79v (~58K steps)/last.ckpt" \
         "checkpoints/tested-fine-trout-of-authority_hydrant 50seq nocrop, from scratch, warp_w=1, warp_recon_w=1, disc_w=0.5, disc_start=15k/last.ckpt" \
-        "checkpoints/gentle-horned-grasshopper-of-serendipity_hydrant 50seq nocrop, toybus-matched hparams: kl=1e-5, warp_w=1, disc_w=0.5, disc_start=15k, grad_accum=4/last.ckpt" \
+        "checkpoints/gent°le-horned-grasshopper-of-serendipity_hydrant 50seq nocrop, toybus-matched hparams: kl=1e-5, warp_w=1, disc_w=0.5, disc_start=15k, grad_accum=4/last.ckpt" \
         weights/f8/model.ckpt \
     --configs \
         config/eqvae_co3d_hydrant_50seq.yaml \

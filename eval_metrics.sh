@@ -25,12 +25,12 @@
 
 python evaluation/evaluate_eqvae.py \
     --checkpoints \
-        "checkpoints/energetic-gleaming-raven-from-camelot_Run A: 128x128, warp_w=0.1, warp_recon=0.1, disc_start=15k, kl=1e-6/last.ckpt" \
+        "checkpoints/exotic-bald-chupacabra-of-artistry_256x256 50seq hydrant, disc_start=0, vanilla_prob=0.3, warp_w=0.1/last.ckpt" \
     --configs \
-        config/warp_vae_hydrant_recon_small.yaml \
-    --model_names "Warp-VAE (128x128, small)" \
-    --data_config config/eval_imagenet128_10k.yaml \
-    --output_dir evaluation_outputs/warp_vae_hydrant_recon_small \
-    --batch_size 32 \
+        config/warp_vae_hydrant_256_disc0_50seq.yaml \
+    --model_names "Warp-VAE 256 (disc0, vanilla=0.3, warp=0.1)" \
+    --data_config config/eval_imagenet256_10k.yaml \
+    --output_dir evaluation_outputs/warp_vae_256_disc0_50seq \
+    --batch_size 16 \
     --num_fid_samples 5000 \
     --num_workers 4
