@@ -136,22 +136,34 @@ def process_poses(co3d_dir, category, output_dir, min_quality):
                 category_data[seq_name] = []
 
             mask_path = filepath.replace("images", "masks").replace(".jpg", ".png")
+            if mask_path not in bbox_data:
+                continue  # sequence not downloaded
             bbox = bbox_data[mask_path]
             if bbox == []:
                 # Mask did not include any object.
                 continue
 
             frame_data = frame_data_processed[seq_name][frame_number]
-            category_data[seq_name].append(
-                {
-                    "filepath": filepath,
-                    "R": frame_data["viewpoint"]["R"],
-                    "T": frame_data["viewpoint"]["T"],
-                    "focal_length": frame_data["viewpoint"]["focal_length"],
-                    "principal_point": frame_data["viewpoint"]["principal_point"],
-                    "bbox": bbox,
-                }
-            )
+            entry = {
+                "filepath": filepath,
+                "R": frame_data["viewpoint"]["R"],
+                "T": frame_data["viewpoint"]["T"],
+                "focal_length": frame_data["viewpoint"]["focal_length"],
+                "principal_point": frame_data["viewpoint"]["principal_point"],
+                "bbox": bbox,
+            }
+            # Include depth info if available
+            depth_info = frame_data.get("depth")
+            if depth_info and depth_info.get("path"):
+                entry["depth_path"] = depth_info["path"]
+                entry["depth_scale_adjustment"] = depth_info.get("scale_adjustment", 1.0)
+                if depth_info.get("mask_path"):
+                    entry["depth_mask_path"] = depth_info["mask_path"]
+            # Include image size for unprojection
+            image_info = frame_data.get("image")
+            if image_info and image_info.get("size"):
+                entry["image_size"] = image_info["size"]  # [W, H]
+            category_data[seq_name].append(entry)
 
         output_file = osp.join(output_dir, f"{category}_{subset}.jgz")
         with gzip.open(output_file, "w") as f:
