@@ -1,5 +1,5 @@
 """
-Metrics for EQVAE evaluation.
+Metrics for VAE evaluation.
 """
 
 from .reconstruction_metrics import ReconstructionMetrics

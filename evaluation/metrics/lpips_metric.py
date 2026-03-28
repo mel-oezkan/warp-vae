@@ -1,35 +1,56 @@
 """
 LPIPS perceptual similarity metric.
+
+Works with any VAE variant via a reconstruct_fn callback.
 """
 
 import torch
-from typing import Dict
+import numpy as np
+from typing import Dict, Optional, Callable
 from tqdm import tqdm
+
+try:
+    import lpips as lpips_lib
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
 
 
 class LPIPSCalculator:
-    """Calculate LPIPS perceptual similarity."""
+    """Calculate LPIPS perceptual similarity between inputs and reconstructions."""
 
-    def __init__(self, model):
+    def __init__(
+        self,
+        device: str = 'cuda',
+        reconstruct_fn: Optional[Callable] = None,
+        net: str = 'vgg',
+    ):
         """
-        Initialize LPIPS calculator.
-
         Args:
-            model: EQVAE model (contains LPIPS in loss module)
+            device: Device to run on
+            reconstruct_fn: Callable (model, images) -> reconstructions.
+                           If None, uses model(images)[0].
+            net: LPIPS backbone ('vgg' or 'alex')
         """
-        self.model = model
-        # Extract LPIPS from model's loss module
-        if hasattr(model, 'loss') and hasattr(model.loss, 'perceptual_loss'):
-            self.lpips = model.loss.perceptual_loss
-        else:
-            raise ValueError("Model does not have LPIPS perceptual loss")
+        self.device = device
+        self.reconstruct_fn = reconstruct_fn
 
-    def compute(self, dataloader, num_samples=None) -> Dict[str, float]:
-        """
-        Compute LPIPS over dataloader.
+        if not LPIPS_AVAILABLE:
+            raise ImportError("lpips package required. Install with: pip install lpips")
+        self.lpips_fn = lpips_lib.LPIPS(net=net).to(device).eval()
+
+    def _get_reconstructions(self, model, images):
+        if self.reconstruct_fn is not None:
+            return self.reconstruct_fn(model, images)
+        reconstructions, *_ = model(images)
+        return reconstructions
+
+    def compute(self, dataloader, model, num_samples=None) -> Dict[str, float]:
+        """Compute LPIPS over dataloader.
 
         Args:
             dataloader: DataLoader with validation data
+            model: VAE model
             num_samples: Maximum number of samples (None for all)
 
         Returns:
@@ -37,29 +58,21 @@ class LPIPSCalculator:
         """
         lpips_values = []
 
-        self.model.eval()
+        model.eval()
         with torch.no_grad():
             for batch_idx, batch in enumerate(tqdm(dataloader, desc="  Computing LPIPS")):
                 if num_samples and batch_idx * dataloader.batch_size >= num_samples:
                     break
 
-                images = batch['image'].to(next(self.model.parameters()).device)
+                images = batch['image'].to(self.device)
+                reconstructions = self._get_reconstructions(model, images)
 
-                # Get reconstructions
-                if hasattr(self.model, 'ema_scope') and hasattr(self.model, 'model_ema'):
-                    with self.model.ema_scope():
-                        reconstructions, _ = self.model(images)
-                else:
-                    reconstructions, _ = self.model(images)
+                # LPIPS expects [-1, 1]; clamp reconstructions
+                reconstructions = reconstructions.clamp(-1, 1)
 
-                # Compute LPIPS
-                # LPIPS expects inputs in range [-1, 1]
-                lpips_val = self.lpips(images, reconstructions)
-
+                lpips_val = self.lpips_fn(images, reconstructions)
                 lpips_values.append(lpips_val.mean().item())
 
-        # Aggregate
-        import numpy as np
         lpips_mean = np.mean(lpips_values)
         lpips_std = np.std(lpips_values)
 
@@ -68,6 +81,5 @@ class LPIPSCalculator:
             'std': float(lpips_std),
         }
 
-        print(f"  ✓ LPIPS: {lpips_mean:.4f} ± {lpips_std:.4f}")
-
+        print(f"  LPIPS: {lpips_mean:.4f} +/- {lpips_std:.4f}")
         return metrics
