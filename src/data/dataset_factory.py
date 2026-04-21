@@ -17,6 +17,7 @@ DATASET_REGISTRY: Dict[str, str] = {
     "omniobject": "src.data.omniobject3d_dataset.OmniObject3DDataset",
     "warp_co3d": "src.data.warp_dataset.WarpCO3DDataset",
     "precomputed_warp": "src.data.warp_dataset.PrecomputedWarpDataset",
+    "imagenet": "src.data.imagenet_dataset.ImageNetDataset",
     # "mvimgnet": "src.data.mvimgnet_dataset.MVImgNetDataset",  # TODO: Implement if needed
 }
 

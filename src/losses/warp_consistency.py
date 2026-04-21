@@ -74,7 +74,7 @@ class WarpConsistencyLoss(nn.Module):
                 warp.permute(0, 3, 1, 2),  # (B, 2, H_w, W_w)
                 size=(H, W),
                 mode="bilinear",
-                align_corners=False
+                align_corners=False,
             ).permute(0, 2, 3, 1)  # (B, H, W, 2)
 
             if confidence is not None:
@@ -82,7 +82,7 @@ class WarpConsistencyLoss(nn.Module):
                     confidence.unsqueeze(1),  # (B, 1, H_w, W_w)
                     size=(H, W),
                     mode="bilinear",
-                    align_corners=False
+                    align_corners=False,
                 ).squeeze(1)  # (B, H, W)
 
         # Apply grid sample for warping
@@ -90,19 +90,19 @@ class WarpConsistencyLoss(nn.Module):
             features,
             warp,
             mode="bilinear",
-            padding_mode="border",
+            padding_mode="zeros",
             align_corners=False
         )
 
-        # Create validity mask based on confidence and in-bounds check
+        # Always check in-bounds, combine with confidence if available
+        in_bounds = (
+            (warp[..., 0] >= -1) & (warp[..., 0] <= 1) &
+            (warp[..., 1] >= -1) & (warp[..., 1] <= 1)
+        )
         if confidence is not None:
-            validity_mask = confidence > self.confidence_threshold
+            validity_mask = (confidence > self.confidence_threshold) & in_bounds
         else:
-            # Check if warp coordinates are within valid range
-            validity_mask = (
-                (warp[..., 0] >= -1) & (warp[..., 0] <= 1) &
-                (warp[..., 1] >= -1) & (warp[..., 1] <= 1)
-            )
+            validity_mask = in_bounds
 
         return warped, validity_mask
 
@@ -171,13 +171,8 @@ class WarpConsistencyLoss(nn.Module):
 
         # Compute mean, accounting for mask
         if mask is not None:
-            num_valid = mask.float().sum()
-            # Avoid NaN when no valid pixels
-            if num_valid > 0:
-                loss = loss.sum() / num_valid
-            else:
-                # Return zero loss if no valid pixels
-                loss = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+            num_valid = mask.float().sum().clamp(min=1.0)
+            loss = loss.sum() / num_valid
         else:
             loss = loss.mean()
 
@@ -243,6 +238,7 @@ class WarpReconstructionLoss(nn.Module):
     Args:
         loss_type: Type of loss ("l1", "l2", "perceptual")
         confidence_weighted: Weight by warp confidence
+        pixel_weight: Weight for pixel-level (L1/L2) loss component
         perceptual_weight: Weight for perceptual loss component
     """
 
@@ -250,6 +246,7 @@ class WarpReconstructionLoss(nn.Module):
         self,
         loss_type: str = "l1",
         confidence_weighted: bool = True,
+        pixel_weight: float = 1.0,
         perceptual_weight: float = 0.0,
         lpips_model: Optional[nn.Module] = None,
     ):
@@ -257,6 +254,7 @@ class WarpReconstructionLoss(nn.Module):
 
         self.loss_type = loss_type
         self.confidence_weighted = confidence_weighted
+        self.pixel_weight = pixel_weight
         self.perceptual_weight = perceptual_weight
 
         # Optional LPIPS model for perceptual loss
@@ -305,12 +303,18 @@ class WarpReconstructionLoss(nn.Module):
                     align_corners=False
                 ).squeeze(1)
 
+        # Compute in-bounds mask before warping
+        in_bounds = (
+            (warp_ab[..., 0] >= -1) & (warp_ab[..., 0] <= 1) &
+            (warp_ab[..., 1] >= -1) & (warp_ab[..., 1] <= 1)
+        )
+
         # Warp reconstruction A to view B (uses flow fields)
         warped_recon = F.grid_sample(
             recon_a,
             warp_ab,
             mode="bilinear",
-            padding_mode="border", 
+            padding_mode="zeros",
             align_corners=False
         )
 
@@ -324,22 +328,27 @@ class WarpReconstructionLoss(nn.Module):
 
         pixel_loss = pixel_loss.mean(dim=1)  # (B, H, W)
 
-        # Apply confidence weighting
+        # Combine in-bounds mask with confidence weighting
         if self.confidence_weighted and confidence_ab is not None:
-            pixel_loss = pixel_loss * confidence_ab
-            loss = pixel_loss.sum() / (confidence_ab.sum() + 1e-8)
+            mask = in_bounds.float() * confidence_ab
+            pixel_loss = pixel_loss * mask
+            loss = pixel_loss.sum() / (mask.sum() + 1e-8)
         else:
-            loss = pixel_loss.mean()
+            pixel_loss = pixel_loss * in_bounds.float()
+            num_valid = in_bounds.float().sum()
+            loss = pixel_loss.sum() / (num_valid + 1e-8)
 
-        result = {"loss": loss, "pixel_loss": loss}
+        result = {"pixel_loss": loss}
 
-        # Add perceptual loss
+        # Combine pixel and perceptual losses
+        total_loss = self.pixel_weight * loss
+
         if self.perceptual_weight > 0 and self.lpips is not None:
-            with torch.no_grad():
-                perceptual = self.lpips(warped_recon, image_b).mean()
+            perceptual = self.lpips(warped_recon, image_b).mean()
             result["perceptual_loss"] = perceptual
-            result["loss"] = loss + self.perceptual_weight * perceptual
+            total_loss = total_loss + self.perceptual_weight * perceptual
 
+        result["loss"] = total_loss
         return result
 
 
@@ -425,3 +434,195 @@ class CycleConsistencyLoss(nn.Module):
             "cycle_error": weighted_error,
             "within_tolerance": within_tolerance,
         }
+
+
+class NaiveWarpConsistencyLoss(nn.Module):
+    """
+    Naive warp equivariance loss inspired by EQ-VAE.
+
+    Instead of encoding two separate views and comparing their latents
+    via warped correspondences (like WarpConsistencyLoss), this loss
+    checks that encoding commutes with warping:
+
+        encode(warp(image_a→b)) ≈ warp(encode(image_a))
+
+    The left side warps the source image to the target view in pixel space,
+    then encodes. The right side encodes the source image first, then warps
+    the latent. If the encoder is truly 3D-aware, these should match.
+
+    Args:
+        loss_type: Type of loss ("l1", "l2", "cosine")
+        confidence_weighted: Whether to weight loss by warp confidence
+        confidence_threshold: Minimum confidence for loss computation
+        bidirectional: Whether to compute loss in both directions
+    """
+
+    def __init__(
+        self,
+        loss_type: str = "l1",
+        confidence_weighted: bool = True,
+        confidence_threshold: float = 0.1,
+        bidirectional: bool = True,
+    ):
+        super().__init__()
+        self.loss_type = loss_type
+        self.confidence_weighted = confidence_weighted
+        self.confidence_threshold = confidence_threshold
+        self.bidirectional = bidirectional
+
+    def _warp_tensor(
+        self,
+        tensor: torch.Tensor,
+        warp: torch.Tensor,
+    ) -> torch.Tensor:
+        """Warp a tensor (image or latent) using a correspondence field."""
+        _, _, H, W = tensor.shape
+        if warp.shape[1] != H or warp.shape[2] != W:
+            warp = F.interpolate(
+                warp.permute(0, 3, 1, 2),
+                size=(H, W),
+                mode="nearest",
+            ).permute(0, 2, 3, 1)
+
+        return F.grid_sample(
+            tensor, warp,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )
+
+    def _get_mask(
+        self,
+        warp: torch.Tensor,
+        H: int, W: int,
+        confidence: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute validity mask at the given spatial resolution."""
+        if warp.shape[1] != H or warp.shape[2] != W:
+            warp = F.interpolate(
+                warp.permute(0, 3, 1, 2),
+                size=(H, W),
+                mode="nearest",
+            ).permute(0, 2, 3, 1)
+            if confidence is not None:
+                confidence = F.interpolate(
+                    confidence.unsqueeze(1),
+                    size=(H, W),
+                    mode="nearest",
+                ).squeeze(1)
+
+        in_bounds = (
+            (warp[..., 0] >= -1) & (warp[..., 0] <= 1) &
+            (warp[..., 1] >= -1) & (warp[..., 1] <= 1)
+        )
+        if confidence is not None:
+            return (confidence > self.confidence_threshold) & in_bounds
+        return in_bounds
+
+    def _masked_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        confidence: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute masked & optionally confidence-weighted loss."""
+        if self.loss_type == "l1":
+            loss = torch.abs(pred - target)
+        elif self.loss_type == "l2":
+            loss = (pred - target) ** 2
+        elif self.loss_type == "cosine":
+            cos_sim = F.cosine_similarity(pred, target, dim=1)
+            loss = (1 - cos_sim).unsqueeze(1)
+        else:
+            raise ValueError(f"Unknown loss_type: {self.loss_type}")
+
+        loss = loss.mean(dim=1)  # (B, H, W)
+        loss = loss * mask.float()
+
+        if self.confidence_weighted and confidence is not None:
+            if confidence.shape[1:] != loss.shape[1:]:
+                confidence = F.interpolate(
+                    confidence.unsqueeze(1),
+                    size=loss.shape[1:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+            loss = loss * confidence
+
+        num_valid = mask.float().sum()
+        if num_valid > 0:
+            return loss.sum() / num_valid
+        return torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
+
+    def _one_direction(
+        self,
+        image_src: torch.Tensor,
+        latent_src: torch.Tensor,
+        encoder_fn,
+        warp: torch.Tensor,
+        confidence: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute loss for one direction:
+            encode(warp(image_src)) vs warp(encode(image_src))
+        """
+        # Left side: warp image in pixel space, then encode
+        warped_image = self._warp_tensor(image_src, warp)
+        posterior = encoder_fn(warped_image)
+        latent_of_warped = posterior.sample()
+
+        # Right side: warp the already-computed latent
+        warped_latent = self._warp_tensor(latent_src, warp)
+
+        # Mask at latent resolution
+        _, _, H, W = latent_src.shape
+        mask = self._get_mask(warp, H, W, confidence)
+
+        return self._masked_loss(latent_of_warped, warped_latent, mask, confidence)
+
+    def forward(
+        self,
+        image_a: torch.Tensor,
+        image_b: torch.Tensor,
+        latent_a: torch.Tensor,
+        latent_b: torch.Tensor,
+        encoder_fn,
+        warp_ab: torch.Tensor,
+        warp_ba: torch.Tensor,
+        confidence_ab: Optional[torch.Tensor] = None,
+        confidence_ba: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute naive warp equivariance loss.
+
+        Args:
+            image_a: Source image (B, 3, H, W)
+            image_b: Target image (B, 3, H, W)
+            latent_a: Latent of source image (B, C, h, w)
+            latent_b: Latent of target image (B, C, h, w)
+            encoder_fn: model.encode callable (returns posterior)
+            warp_ab: Warp field A→B (B, H_w, W_w, 2)
+            warp_ba: Warp field B→A (B, H_w, W_w, 2)
+            confidence_ab: Confidence map A→B (B, H_w, W_w)
+            confidence_ba: Confidence map B→A (B, H_w, W_w)
+
+        Returns:
+            Dict with 'loss', 'loss_ab', and optionally 'loss_ba'
+        """
+        loss_ab = self._one_direction(
+            image_a, latent_a, encoder_fn, warp_ab, confidence_ab,
+        )
+
+        result = {"loss_ab": loss_ab}
+
+        if self.bidirectional:
+            loss_ba = self._one_direction(
+                image_b, latent_b, encoder_fn, warp_ba, confidence_ba,
+            )
+            result["loss_ba"] = loss_ba
+            result["loss"] = (loss_ab + loss_ba) / 2.0
+        else:
+            result["loss"] = loss_ab
+
+        return result

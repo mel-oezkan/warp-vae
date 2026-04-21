@@ -125,8 +125,18 @@ def load_model(checkpoint_path: str, config_path: str, model_type: str = "auto")
         else:
             raise ValueError("YAML config must contain 'model' key")
 
+    # Filter out keys with shape mismatches (e.g. discriminator trained with different config)
+    model_state = model.state_dict()
+    filtered_state_dict = {
+        k: v for k, v in state_dict.items()
+        if k not in model_state or v.shape == model_state[k].shape
+    }
+    n_skipped = len(state_dict) - len(filtered_state_dict)
+    if n_skipped:
+        print(f"  Skipped {n_skipped} keys due to shape mismatch")
+
     # Load weights
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(filtered_state_dict, strict=False)
     if missing:
         print(f"  Warning: {len(missing)} missing keys")
     if unexpected:

@@ -71,6 +71,10 @@ def main():
     parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--categories", nargs="+", default=None,
                         help="Filter to specific CO3D categories (e.g., hydrant chair car)")
+    parser.add_argument(
+        "--black_threshold", type=float, default=0.01,
+        help="Minimum mean pixel intensity in [0,1] to consider an image non-black",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="eval_outputs/latent_pca_grid.png")
     args = parser.parse_args()
@@ -86,6 +90,8 @@ def main():
 
     if args.view_stride < 1:
         raise ValueError("--view_stride must be >= 1")
+    if not (0.0 <= args.black_threshold <= 1.0):
+        raise ValueError("--black_threshold must be in [0, 1]")
 
     transform = transforms.Compose([
         transforms.Resize((args.image_size, args.image_size)),
@@ -106,15 +112,87 @@ def main():
     # Filter by category if specified
     if args.categories:
         object_ids = [oid for oid in object_ids if oid[0] in args.categories]
+        rng = np.random.default_rng(args.seed)
+        rng.shuffle(object_ids)
         print(f"Filtered to categories {args.categories}: {len(object_ids)} sequences")
 
+    n_views = args.views_per_object
+
+    def select_view_indices(num_available):
+        if n_views == 1:
+            return [min(args.view_index, num_available - 1)]
+
+        if args.view_sampling == "linspace":
+            return np.linspace(0, num_available - 1, n_views, dtype=int).tolist()
+
+        span = (n_views - 1) * args.view_stride + 1
+        if num_available <= span:
+            # Sequence too short: keep as close as possible and clip to last frame.
+            return [
+                min(i * args.view_stride, num_available - 1)
+                for i in range(n_views)
+            ]
+
+        max_start = num_available - span
+        if args.start_view is None:
+            start = max_start // 2
+        else:
+            start = int(np.clip(args.start_view, 0, max_start))
+        return [start + i * args.view_stride for i in range(n_views)]
+
+    def _is_black(obj_id, view_idx):
+        img_pil = adapter.load_view_image_pil(obj_id, view_idx, size=args.image_size)
+        return np.asarray(img_pil, dtype=np.float32).mean() / 255.0 <= args.black_threshold
+
+    def _replace_black_frames(obj_id, view_indices, num_available):
+        """Replace black frames with the nearest non-black frame."""
+        cleaned = []
+        for idx in view_indices:
+            if not _is_black(obj_id, idx):
+                cleaned.append(idx)
+                continue
+            # Search outward for a non-black replacement
+            found = False
+            for offset in range(1, num_available):
+                for candidate in [idx + offset, idx - offset]:
+                    if 0 <= candidate < num_available and candidate not in cleaned:
+                        if not _is_black(obj_id, candidate):
+                            cleaned.append(candidate)
+                            found = True
+                            break
+                if found:
+                    break
+            if not found:
+                cleaned.append(idx)  # keep original if no replacement found
+        return cleaned
+
+    # Keep only sequences that have at least one non-black view.
+    valid_object_ids = []
+    for obj_id in object_ids:
+        num_available = adapter.get_num_views(obj_id)
+        view_indices = select_view_indices(num_available)
+        cleaned = _replace_black_frames(obj_id, view_indices, num_available)
+        # Reject only if ALL views are black
+        if any(not _is_black(obj_id, vi) for vi in cleaned):
+            valid_object_ids.append(obj_id)
+
+    print(
+        f"Valid non-black sequences: {len(valid_object_ids)} / {len(object_ids)} "
+        f"(threshold={args.black_threshold})"
+    )
+
     # Take only num_objects
-    object_ids = object_ids[:args.num_objects]
+    object_ids = valid_object_ids[:args.num_objects]
     n_objects = len(object_ids)
     print(f"Selected {n_objects} objects")
 
+    if n_objects == 0:
+        cats = f" in categories {args.categories}" if args.categories else ""
+        print(f"ERROR: No valid (non-black) objects found{cats}. "
+              "Try different --categories, --seed, or lower --black_threshold.")
+        sys.exit(1)
+
     n_models = len(args.checkpoints)
-    n_views = args.views_per_object
     model_names = list(args.model_names)[:n_models]
 
     # Pre-load images (no GPU needed for this beyond the transform)
@@ -123,26 +201,8 @@ def main():
     view_indices_per_obj = []
     for obj_idx, obj_id in enumerate(object_ids):
         num_available = adapter.get_num_views(obj_id)
-        if n_views == 1:
-            view_indices = [min(args.view_index, num_available - 1)]
-        else:
-            if args.view_sampling == "linspace":
-                view_indices = np.linspace(0, num_available - 1, n_views, dtype=int).tolist()
-            else:
-                span = (n_views - 1) * args.view_stride + 1
-                if num_available <= span:
-                    # Sequence too short: keep as close as possible and clip to last frame.
-                    view_indices = [
-                        min(i * args.view_stride, num_available - 1)
-                        for i in range(n_views)
-                    ]
-                else:
-                    max_start = num_available - span
-                    if args.start_view is None:
-                        start = max_start // 2
-                    else:
-                        start = int(np.clip(args.start_view, 0, max_start))
-                    view_indices = [start + i * args.view_stride for i in range(n_views)]
+        view_indices = select_view_indices(num_available)
+        view_indices = _replace_black_frames(obj_id, view_indices, num_available)
         view_indices_per_obj.append(view_indices)
         for view_idx in view_indices:
             img = adapter.load_view_image(obj_id, view_idx, transform, device)
@@ -230,7 +290,7 @@ def main():
             axes[0, col].imshow(np.clip(img_np, 0, 1))
             category = object_ids[obj_idx][0]
             if n_views > 1:
-                axes[0, col].set_title(f"{category}\nview {v_idx}", fontsize=14, fontweight="bold")
+                axes[0, col].set_title(f"view {v_idx}", fontsize=14, fontweight="bold")
             else:
                 axes[0, col].set_title(category, fontsize=14, fontweight="bold")
             axes[0, col].axis("off")
@@ -252,7 +312,7 @@ def main():
         bbox = axes[row, 0].get_position()
         fig.text(
             bbox.x0 - 0.01, (bbox.y0 + bbox.y1) / 2, label,
-            fontsize=14, fontweight="bold", ha="right", va="center", rotation=90
+            fontsize=18, fontweight="bold", ha="right", va="center", rotation=90
         )
 
     output_path = Path(args.output)

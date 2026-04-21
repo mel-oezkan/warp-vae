@@ -278,10 +278,11 @@ class BaseVAETrainer(pl.LightningModule):
             self.log("memory/reserved_mb", mem_stats.get('reserved_mb', 0), logger=True, sync_dist=False)
 
         # ========== Optimize Discriminator ==========
-        # Discriminator loss
+        # Detach reconstructions to free the autoencoder computation graph,
+        # reducing peak memory during discriminator backward pass.
         discloss, log_dict_disc = self.model.loss(
             inputs,
-            reconstructions,
+            reconstructions.detach(),
             posterior,
             1,  # optimizer_idx for discriminator
             self.global_step,
@@ -445,15 +446,15 @@ class BaseVAETrainer(pl.LightningModule):
         log = {}
         inputs = self.get_input(batch, self.image_key)
         log["inputs"] = inputs
-        
+
         if not only_inputs:
             model_output = self._get_model_output(batch)
             reconstructions = model_output[0]
             log["reconstructions"] = reconstructions
-            
+
             # Add model-specific images
             log.update(self._get_additional_log_images(batch, model_output))
-        
+
         return log
     
     def _get_additional_log_images(

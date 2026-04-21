@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from typing import Dict, Any, Tuple, List, Optional
 
 from src.trainer.base_trainer import BaseVAETrainer
-from src.losses.warp_consistency import WarpConsistencyLoss, WarpReconstructionLoss
+from src.losses.warp_consistency import WarpConsistencyLoss, WarpReconstructionLoss, NaiveWarpConsistencyLoss
 
 
 class VanillaVAETrainer(BaseVAETrainer):
@@ -354,9 +354,10 @@ class EQVAETrainer(BaseVAETrainer):
         self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
 
         # ========== Optimize Discriminator ==========
+        # Detach reconstructions to free the autoencoder computation graph
         discloss, log_dict_disc = self.model.loss(
             target,
-            reconstructions,
+            reconstructions.detach(),
             posterior,
             1,  # optimizer_idx for discriminator
             self.global_step,
@@ -429,6 +430,8 @@ class WarpVAETrainer(BaseVAETrainer):
         # Warp-specific parameters
         warp_consistency_weight: float = 1.0,
         warp_reconstruction_weight: float = 0.0,
+        warp_recon_pixel_weight: float = 1.0,
+        warp_recon_perceptual_weight: float = 0.0,
         consistency_loss_type: str = "l1",
         bidirectional: bool = True,
         confidence_weighted: bool = True,
@@ -485,9 +488,13 @@ class WarpVAETrainer(BaseVAETrainer):
 
         # Optional warp reconstruction loss
         if warp_reconstruction_weight > 0:
+            lpips_model = self.model.loss.perceptual_loss if warp_recon_perceptual_weight > 0 else None
             self.warp_reconstruction_loss = WarpReconstructionLoss(
                 loss_type="l1",
                 confidence_weighted=confidence_weighted,
+                pixel_weight=warp_recon_pixel_weight,
+                perceptual_weight=warp_recon_perceptual_weight,
+                lpips_model=lpips_model,
             )
         else:
             self.warp_reconstruction_loss = None
@@ -507,30 +514,29 @@ class WarpVAETrainer(BaseVAETrainer):
         print(f"  - vanilla_probability={vanilla_probability}")
         print(f"  - gradient_accumulation_steps={gradient_accumulation_steps}")
 
-    def _get_model_output(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Any]:
+    def _get_model_output(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Any, torch.Tensor]:
         """
         Get model output for source image.
 
         Returns:
-            Tuple of (reconstructions, posterior)
+            Tuple of (reconstructions, posterior, latent_z)
         """
         inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self.model(inputs, sample_posterior=True)
-        return reconstructions, posterior
+        reconstructions, posterior, z = self.model(inputs, sample_posterior=True, return_latent=True)
+        return reconstructions, posterior, z
 
     def _get_target_encoding(self, batch: Dict[str, Any]) -> torch.Tensor:
         """
         Encode target image to latent space.
-        Uses no_grad since the target latent serves as a fixed reference —
-        gradients flow through the source latent only.
+        Gradients flow through both source and target latents so the
+        encoder learns symmetric consistency.
 
         Returns:
             Latent code for target image (B, C, H, W)
         """
         target = self.get_input(batch, self.target_key)
-        with torch.no_grad():
-            posterior = self.model.encode(target)
-            return posterior.sample()
+        posterior = self.model.encode(target)
+        return posterior.mode()
 
     def _compute_warp_losses(
         self,
@@ -632,11 +638,10 @@ class WarpVAETrainer(BaseVAETrainer):
         accum_steps = self.gradient_accumulation_steps
 
         # Get source image and encoding.
-        # sample_posterior=True draws z for decoding; we reuse the same posterior
-        # sample for latent_a so both gradient paths refer to the same z.
+        # return_latent=True ensures we reuse the exact z sample used for decoding,
+        # so the warp consistency gradient flows through the same latent.
         inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self.model(inputs, sample_posterior=True)
-        latent_a = posterior.sample()
+        reconstructions, posterior, latent_a = self.model(inputs, sample_posterior=True, return_latent=True)
 
         # Decide whether to use vanilla loss only (skip warp loss)
         use_vanilla_only = torch.rand(1).item() < self.vanilla_probability
@@ -655,11 +660,12 @@ class WarpVAETrainer(BaseVAETrainer):
 
         # Compute warp loss only if not using vanilla mode
         if use_vanilla_only:
-            warp_loss = torch.tensor(0.0, device=inputs.device, dtype=inputs.dtype, requires_grad=True)
+            warp_loss = torch.zeros(1, device=inputs.device, dtype=inputs.dtype)
             warp_log_dict = {
                 "train/warp_consistency_loss": torch.tensor(0.0, device=inputs.device, dtype=inputs.dtype),
                 "train/warp_factor": torch.tensor(0.0, device=inputs.device, dtype=inputs.dtype),
             }
+            
         else:
             # Get target encoding
             latent_b = self._get_target_encoding(batch)
@@ -682,15 +688,15 @@ class WarpVAETrainer(BaseVAETrainer):
             opt_ae.zero_grad()
 
         # Log losses (unscaled for interpretability)
-        # Note: sync_dist=True ensures logs are synced to logger on every step
-        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/warp_loss", warp_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/total_ae_loss", total_ae_loss, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/vanilla_mode", float(use_vanilla_only), prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
+        # sync_dist=False for training logs to avoid blocking all-reduce on every step
+        self.log("train/aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        self.log("train/warp_loss", warp_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        self.log("train/total_ae_loss", total_ae_loss, prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        self.log("train/vanilla_mode", float(use_vanilla_only), prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
         # Filter out total_loss from log_dict_ae to avoid duplicate logging
         log_dict_ae_filtered = {k: v for k, v in log_dict_ae.items() if "total_loss" not in k}
-        self.log_dict(log_dict_ae_filtered, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
-        self.log_dict(warp_log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
+        self.log_dict(log_dict_ae_filtered, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
+        self.log_dict(warp_log_dict, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
 
         # Log memory usage periodically
         if batch_idx % 100 == 0:
@@ -698,9 +704,11 @@ class WarpVAETrainer(BaseVAETrainer):
             self.log("memory/allocated_mb", mem_stats.get('allocated_mb', 0), logger=True, sync_dist=True)
 
         # ========== Optimize Discriminator ==========
+        # Detach reconstructions to free the autoencoder computation graph,
+        # reducing peak memory during discriminator backward pass.
         discloss, log_dict_disc = self.model.loss(
             inputs,
-            reconstructions,
+            reconstructions.detach(),
             posterior,
             1,  # optimizer_idx for discriminator
             self.global_step,
@@ -719,8 +727,8 @@ class WarpVAETrainer(BaseVAETrainer):
             opt_disc.step()
             opt_disc.zero_grad()
 
-        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
-        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=True)
+        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
+        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
 
         return total_ae_loss
 
@@ -734,8 +742,7 @@ class WarpVAETrainer(BaseVAETrainer):
         Validation step with warp consistency metrics.
         """
         inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self.model(inputs, sample_posterior=True)
-        latent_a = posterior.sample()
+        reconstructions, posterior, latent_a = self.model(inputs, sample_posterior=True, return_latent=True)
 
         # Get target encoding
         latent_b = self._get_target_encoding(batch)
@@ -836,450 +843,3 @@ class WarpVAETrainer(BaseVAETrainer):
                 log["warped_recon_to_target"] = warped_recon
 
         return log
-
-
-# =============================================================================
-# PluckerVAE Variant Trainers
-# =============================================================================
-
-
-class PluckerConditionedVAETrainer(BaseVAETrainer):
-    """
-    Trainer for PluckerConditionedVAE (Variant 3).
-
-    Plucker coordinates are provided as input conditioning.
-    The decoder reconstructs both image and Plucker rays.
-    No encoder-side Plucker prediction.
-    """
-
-    def __init__(
-        self,
-        model_config: Dict[str, Any],
-        learning_rate: float = 4.5e-6,
-        ema_decay: Optional[float] = None,
-        image_key: str = "image",
-        plucker_key: str = "plucker_coords",
-        log_images_every_n_steps: int = 500,
-        checkpoint_path: Optional[str] = None,
-        ignore_keys: List[str] = [],
-        # Loss weights
-        plucker_recon_weight: float = 0.5,
-        plucker_constraint_weight: float = 0.1,
-    ):
-        """
-        Initialize PluckerConditionedVAE trainer.
-
-        Args:
-            model_config: Config for PluckerConditionedVAE instantiation
-            plucker_key: Key for Plucker coordinates in batch (should be full-res)
-            plucker_recon_weight: Weight for decoder Plucker reconstruction loss
-            plucker_constraint_weight: Weight for Plucker geometric constraints
-        """
-        super().__init__(
-            model_config=model_config,
-            learning_rate=learning_rate,
-            ema_decay=ema_decay,
-            image_key=image_key,
-            log_images_every_n_steps=log_images_every_n_steps,
-            checkpoint_path=checkpoint_path,
-            ignore_keys=ignore_keys,
-        )
-
-        self.plucker_key = plucker_key
-        self.plucker_recon_weight = plucker_recon_weight
-        self.plucker_constraint_weight = plucker_constraint_weight
-
-        print(f"[PluckerConditionedVAETrainer] Initialized with "
-              f"plucker_recon_weight={plucker_recon_weight}, "
-              f"constraint_weight={plucker_constraint_weight}")
-
-    def _get_model_output(self, batch: Dict[str, Any]) -> Tuple:
-        """
-        Get model output including Plucker reconstruction.
-
-        Returns:
-            Tuple of (recon_img, posterior, recon_plucker)
-            Note: Order is (reconstruction, posterior, ...) for base trainer compatibility
-        """
-        inputs = self.get_input(batch, self.image_key)
-        gt_plucker = batch[self.plucker_key].to(inputs.device)
-
-        recon_img, recon_plucker, posterior = self.model(
-            inputs, gt_plucker, sample_posterior=True
-        )
-        return recon_img, posterior, recon_plucker
-
-    def _compute_additional_losses(
-        self,
-        batch: Dict[str, Any],
-        model_output: Tuple[Any, ...],
-        split: str = "train"
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Compute Plucker reconstruction and constraint losses.
-        """
-        recon_img, posterior, recon_plucker = model_output
-        gt_plucker = batch[self.plucker_key].to(recon_plucker.device)
-
-        # Plucker reconstruction loss (MSE)
-        plucker_recon_loss = F.mse_loss(recon_plucker, gt_plucker)
-
-        # Plucker constraints (orthogonality + normalization)
-        constraint_loss = self.model.plucker_constraint_loss(recon_plucker)
-
-        # Weighted total
-        total_plucker_loss = (
-            self.plucker_recon_weight * plucker_recon_loss +
-            self.plucker_constraint_weight * constraint_loss
-        )
-
-        log_dict = {
-            f"{split}/plucker_recon_loss": plucker_recon_loss.detach(),
-            f"{split}/plucker_constraint_loss": constraint_loss.detach(),
-            f"{split}/plucker_total_loss": total_plucker_loss.detach(),
-        }
-
-        return total_plucker_loss, log_dict
-
-    def _get_additional_ae_params(self) -> List[torch.nn.Parameter]:
-        """Include decoder head parameters in optimization."""
-        params = []
-        if hasattr(self.model, 'decoder_img_head'):
-            params.extend(list(self.model.decoder_img_head.parameters()))
-        if hasattr(self.model, 'decoder_plucker_head'):
-            params.extend(list(self.model.decoder_plucker_head.parameters()))
-        return params
-
-
-class DirectPluckerVAETrainer(BaseVAETrainer):
-    """
-    Trainer for DirectPluckerVAE (Variant 2).
-
-    Similar to PluckerConditionedVAETrainer but emphasizes
-    Plucker prediction as an auxiliary task.
-    """
-
-    def __init__(
-        self,
-        model_config: Dict[str, Any],
-        learning_rate: float = 4.5e-6,
-        ema_decay: Optional[float] = None,
-        image_key: str = "image",
-        plucker_key: str = "plucker_coords",
-        log_images_every_n_steps: int = 500,
-        checkpoint_path: Optional[str] = None,
-        ignore_keys: List[str] = [],
-        # Loss weights
-        plucker_recon_weight: float = 0.5,
-        plucker_constraint_weight: float = 0.1,
-    ):
-        super().__init__(
-            model_config=model_config,
-            learning_rate=learning_rate,
-            ema_decay=ema_decay,
-            image_key=image_key,
-            log_images_every_n_steps=log_images_every_n_steps,
-            checkpoint_path=checkpoint_path,
-            ignore_keys=ignore_keys,
-        )
-
-        self.plucker_key = plucker_key
-        self.plucker_recon_weight = plucker_recon_weight
-        self.plucker_constraint_weight = plucker_constraint_weight
-
-        print(f"[DirectPluckerVAETrainer] Initialized with "
-              f"plucker_recon_weight={plucker_recon_weight}, "
-              f"constraint_weight={plucker_constraint_weight}")
-
-    def _get_model_output(self, batch: Dict[str, Any]) -> Tuple:
-        """
-        Get model output including Plucker reconstruction.
-
-        Returns:
-            Tuple of (recon_img, posterior, recon_plucker)
-            Note: Order is (reconstruction, posterior, ...) for base trainer compatibility
-        """
-        inputs = self.get_input(batch, self.image_key)
-        gt_plucker = batch[self.plucker_key].to(inputs.device)
-
-        recon_img, recon_plucker, posterior = self.model(
-            inputs, gt_plucker, sample_posterior=True
-        )
-        return recon_img, posterior, recon_plucker
-
-    def _compute_additional_losses(
-        self,
-        batch: Dict[str, Any],
-        model_output: Tuple[Any, ...],
-        split: str = "train"
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute Plucker reconstruction and constraint losses."""
-        recon_img, posterior, recon_plucker = model_output
-        gt_plucker = batch[self.plucker_key].to(recon_plucker.device)
-
-        # Split Plucker into direction and moment for detailed loss
-        gt_d, gt_m = gt_plucker[:, :3], gt_plucker[:, 3:]
-        pred_d, pred_m = recon_plucker[:, :3], recon_plucker[:, 3:]
-
-        # Separate losses for logging
-        d_loss = F.mse_loss(pred_d, gt_d)
-        m_loss = F.mse_loss(pred_m, gt_m)
-        plucker_recon_loss = d_loss + m_loss
-
-        # Constraints
-        constraint_loss = self.model.plucker_constraint_loss(recon_plucker)
-
-        total_plucker_loss = (
-            self.plucker_recon_weight * plucker_recon_loss +
-            self.plucker_constraint_weight * constraint_loss
-        )
-
-        log_dict = {
-            f"{split}/plucker_d_loss": d_loss.detach(),
-            f"{split}/plucker_m_loss": m_loss.detach(),
-            f"{split}/plucker_recon_loss": plucker_recon_loss.detach(),
-            f"{split}/plucker_constraint_loss": constraint_loss.detach(),
-            f"{split}/plucker_total_loss": total_plucker_loss.detach(),
-        }
-
-        return total_plucker_loss, log_dict
-
-    def _get_additional_ae_params(self) -> List[torch.nn.Parameter]:
-        """Include decoder head parameters in optimization."""
-        params = []
-        if hasattr(self.model, 'decoder_img_head'):
-            params.extend(list(self.model.decoder_img_head.parameters()))
-        if hasattr(self.model, 'decoder_plucker_head'):
-            params.extend(list(self.model.decoder_plucker_head.parameters()))
-        return params
-
-
-class ConcatPluckerVAETrainer(BaseVAETrainer):
-    """
-    Trainer for ConcatPluckerVAE (Variant 1).
-
-    Most complex variant with:
-    - Three separate latent distributions (image, direction, moment)
-    - Encoder-side Plucker prediction
-    - Three decoder output heads
-    - Multiple KL divergence terms
-    """
-
-    def __init__(
-        self,
-        model_config: Dict[str, Any],
-        learning_rate: float = 4.5e-6,
-        ema_decay: Optional[float] = None,
-        image_key: str = "image",
-        plucker_key: str = "plucker_coords",
-        log_images_every_n_steps: int = 500,
-        checkpoint_path: Optional[str] = None,
-        ignore_keys: List[str] = [],
-        # Loss weights (can override model defaults)
-        img_recon_weight: float = 1.0,
-        d_recon_weight: float = 0.5,
-        m_recon_weight: float = 0.5,
-        encoder_plucker_weight: float = 0.3,
-        plucker_constraint_weight: float = 0.1,
-        kl_weight_img: float = 1e-6,
-        kl_weight_d: float = 1e-6,
-        kl_weight_m: float = 1e-6,
-    ):
-        """
-        Initialize ConcatPluckerVAE trainer.
-
-        Args:
-            img_recon_weight: Weight for image reconstruction loss
-            d_recon_weight: Weight for direction reconstruction loss
-            m_recon_weight: Weight for moment reconstruction loss
-            encoder_plucker_weight: Weight for encoder Plucker prediction (L1)
-            plucker_constraint_weight: Weight for geometric constraints
-            kl_weight_*: KL divergence weights for each latent space
-        """
-        super().__init__(
-            model_config=model_config,
-            learning_rate=learning_rate,
-            ema_decay=ema_decay,
-            image_key=image_key,
-            log_images_every_n_steps=log_images_every_n_steps,
-            checkpoint_path=checkpoint_path,
-            ignore_keys=ignore_keys,
-        )
-
-        self.plucker_key = plucker_key
-        self.img_recon_weight = img_recon_weight
-        self.d_recon_weight = d_recon_weight
-        self.m_recon_weight = m_recon_weight
-        self.encoder_plucker_weight = encoder_plucker_weight
-        self.plucker_constraint_weight = plucker_constraint_weight
-        self.kl_weight_img = kl_weight_img
-        self.kl_weight_d = kl_weight_d
-        self.kl_weight_m = kl_weight_m
-
-        print(f"[ConcatPluckerVAETrainer] Initialized with weights:")
-        print(f"  img_recon={img_recon_weight}, d_recon={d_recon_weight}, m_recon={m_recon_weight}")
-        print(f"  encoder_plucker={encoder_plucker_weight}, constraint={plucker_constraint_weight}")
-        print(f"  kl_img={kl_weight_img}, kl_d={kl_weight_d}, kl_m={kl_weight_m}")
-
-    def _get_model_output(self, batch: Dict[str, Any]) -> Tuple:
-        """
-        Get model output including all reconstructions and encoder prediction.
-
-        Returns:
-            Tuple of (recon_img, recon_d, recon_m, posteriors, pluck_pred)
-        """
-        inputs = self.get_input(batch, self.image_key)
-        gt_plucker = batch[self.plucker_key].to(inputs.device)
-
-        recon_img, recon_d, recon_m, posteriors, pluck_pred = self.model(
-            inputs, gt_plucker, sample_posterior=True
-        )
-        return recon_img, recon_d, recon_m, posteriors, pluck_pred
-
-    def training_step(self, batch: Dict[str, Any], batch_idx: int):
-        """
-        Custom training step for ConcatPluckerVAE.
-
-        Handles three separate KL terms and multiple reconstruction losses.
-        """
-        opt_ae, opt_disc = self.optimizers()
-
-        inputs = self.get_input(batch, self.image_key)
-        gt_plucker = batch[self.plucker_key].to(inputs.device)
-
-        # Forward pass
-        recon_img, recon_d, recon_m, posteriors, pluck_pred = self.model(
-            inputs, gt_plucker, sample_posterior=True
-        )
-        posterior_img, posterior_d, posterior_m = posteriors
-
-        # Ground truth components
-        gt_d = gt_plucker[:, :3]  # (B, 3, H, W)
-        gt_m = gt_plucker[:, 3:]  # (B, 3, H, W)
-
-        # ========== Reconstruction Losses ==========
-        # Image reconstruction (use LPIPS loss from model)
-        rec_loss_img, log_dict_ae = self.model.loss(
-            inputs,
-            recon_img,
-            posterior_img,  # Only image posterior for standard loss
-            0,  # optimizer_idx
-            self.global_step,
-            last_layer=self.model.get_last_layer(),
-            split="train",
-        )
-
-        # Direction and moment reconstruction (simple MSE)
-        rec_loss_d = F.mse_loss(recon_d, gt_d)
-        rec_loss_m = F.mse_loss(recon_m, gt_m)
-
-        # Weighted reconstruction
-        total_recon_loss = (
-            self.img_recon_weight * rec_loss_img +
-            self.d_recon_weight * rec_loss_d +
-            self.m_recon_weight * rec_loss_m
-        )
-
-        # ========== KL Divergence Losses ==========
-        kl_img = posterior_img.kl().mean()
-        kl_d = posterior_d.kl().mean()
-        kl_m = posterior_m.kl().mean()
-
-        total_kl_loss = (
-            self.kl_weight_img * kl_img +
-            self.kl_weight_d * kl_d +
-            self.kl_weight_m * kl_m
-        )
-
-        # ========== Encoder Plucker Loss (L1) ==========
-        # Encoder predicts patch-based Plucker (n_patches x n_patches)
-        # Need to compute GT at same resolution
-        n_patches = self.model.n_patches
-        gt_plucker_patches = F.interpolate(
-            gt_plucker, size=(n_patches, n_patches), mode='bilinear', align_corners=False
-        )
-        gt_plucker_patches = gt_plucker_patches.permute(0, 2, 3, 1).reshape(
-            gt_plucker_patches.shape[0], -1, 6
-        )
-
-        encoder_plucker_loss = F.l1_loss(pluck_pred, gt_plucker_patches)
-
-        # ========== Constraint Loss ==========
-        constraint_loss = self.model.plucker_constraint_loss(recon_d, recon_m)
-
-        # ========== Total AE Loss ==========
-        total_ae_loss = (
-            total_recon_loss +
-            total_kl_loss +
-            self.encoder_plucker_weight * encoder_plucker_loss +
-            self.plucker_constraint_weight * constraint_loss
-        )
-
-        # Optimize autoencoder
-        opt_ae.zero_grad()
-        self.manual_backward(total_ae_loss)
-        opt_ae.step()
-
-        # ========== Log Losses ==========
-        self.log("train/total_ae_loss", total_ae_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
-        self.log("train/rec_loss_img", rec_loss_img, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
-        self.log("train/rec_loss_d", rec_loss_d, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
-        self.log("train/rec_loss_m", rec_loss_m, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
-        self.log("train/kl_img", kl_img, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
-        self.log("train/kl_d", kl_d, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
-        self.log("train/kl_m", kl_m, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
-        self.log("train/encoder_plucker_loss", encoder_plucker_loss, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
-        self.log("train/constraint_loss", constraint_loss, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
-        self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
-
-        # ========== Optimize Discriminator ==========
-        discloss, log_dict_disc = self.model.loss(
-            inputs,
-            recon_img,
-            posterior_img,
-            1,  # discriminator
-            self.global_step,
-            last_layer=self.model.get_last_layer(),
-            split="train",
-        )
-
-        opt_disc.zero_grad()
-        self.manual_backward(discloss)
-        opt_disc.step()
-
-        self.log("train/discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=False)
-        self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False, sync_dist=False)
-
-        return total_ae_loss
-
-    def _get_additional_ae_params(self) -> List[torch.nn.Parameter]:
-        """Include all variant-specific parameters."""
-        params = []
-
-        # Quantization convolutions
-        if hasattr(self.model, 'quant_conv_img'):
-            params.extend(list(self.model.quant_conv_img.parameters()))
-        if hasattr(self.model, 'quant_conv_d'):
-            params.extend(list(self.model.quant_conv_d.parameters()))
-        if hasattr(self.model, 'quant_conv_m'):
-            params.extend(list(self.model.quant_conv_m.parameters()))
-
-        # Decoder heads
-        if hasattr(self.model, 'decoder_img_head'):
-            params.extend(list(self.model.decoder_img_head.parameters()))
-        if hasattr(self.model, 'decoder_d_head'):
-            params.extend(list(self.model.decoder_d_head.parameters()))
-        if hasattr(self.model, 'decoder_m_head'):
-            params.extend(list(self.model.decoder_m_head.parameters()))
-
-        # Encoder Plucker head
-        if hasattr(self.model, 'pluck_head'):
-            params.extend(list(self.model.pluck_head.parameters()))
-        if hasattr(self.model, 'pluck_norm_in'):
-            params.extend(list(self.model.pluck_norm_in.parameters()))
-        if hasattr(self.model, 'pluck_proj_layers'):
-            params.extend(list(self.model.pluck_proj_layers.parameters()))
-        if hasattr(self.model, 'pluck_proj_out'):
-            params.extend(list(self.model.pluck_proj_out.parameters()))
-
-        return params

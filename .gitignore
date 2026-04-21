@@ -1,47 +1,44 @@
+# Data
 /data/*
-/data/*.jpg
+
+# Build artifacts
 pretrained/
-uv.lock
-__pycache__
-__pycache__/*
+__pycache__/
 **/__pycache__/
-**/__pycache__/*
-__pycache__*/
 *.pyc
-.venv
+.venv/
 .python-version
+
+# Outputs
 latent_batches/
-pyproject.toml
-taming-transformers/*
-taming-transformers
 model_storage/
 output/
-.gitmodules/
-sd21_vae_local/
-.venv/
-wandb/
-__pycache__*
-*__pycache__
-.log
 outputs/
-taming/
-sd_model
-vae-finetuning
-ldm/**/__pycache__/
-checkpoints/
-weights/
-.claude/
-**.pyc
-ldm/__pycache__/util.cpython-310.pyc
-ldm/__pycache__
-lightning_logs/evaluation_outputs/
 lightning_logs/
 evaluation_outputs/
-*.ipynb
-**.ipynb
-*/*/*.ipynb
-evaluation/notebooks/*
 eval_outputs/
-tests/*
+checkpoints/
+weights/
+sd_model/
+sd21_vae_local/
+vae-finetuning/
+
+# Tools / IDE
+.claude/
+.gitmodules/
+.log
+wandb/
+
+# Notebooks
+*.ipynb
+evaluation/notebooks/*
+
+# Generated images / archives
+*.png
+*.zip
+
+# Docs
 docs/report/
+
+# Build
 kaggle_build/*
