@@ -1,14 +1,21 @@
-# WARP-VAE training on CO3D hydrant with precomputed warps (CROPPED)
-# From scratch with warp consistency + WarpReconstructionLoss enabled
+# EQ-VAE training on CO3D hydrant 50seq (CROPPED)
+# Matched to warp_vae_hydrant_recon_crop runs for fair comparison
 #
-# Run: CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_hydrant_recon_crop
+# Run: CUDA_VISIBLE_DEVICES=1 python train.py --config-name=eqvae_hydrant_cropped +pretrained_weights="./weights/f8/model.ckpt"
 
 model:
-  target: ldm.models.autoencoder.AutoencoderKL
+  target: ldm.models.autoencoder.EQVAEAutoencoder
   params:
     embed_dim: 4
     monitor: val/rec_loss
     image_key: "image"
+
+    # EQ-VAE specific parameters
+    p_prior: 0.5
+    p_prior_s: 0.25
+    anisotropic: false
+    use_rotation: true
+    equivariance_weight: 1.0
 
     ddconfig:
       double_z: true
@@ -34,33 +41,21 @@ model:
         use_actnorm: false
 
 trainer:
-  target: src.trainer.vae_trainers.WarpVAETrainer
-  params:
-    target_key: "image_target"
-    warp_consistency_weight: 0.5
-    warp_reconstruction_weight: 0.02
-    warp_recon_pixel_weight: 0.0
-    warp_recon_perceptual_weight: 1.0
-    consistency_loss_type: "l1"
-    bidirectional: true
-    confidence_weighted: true
-    loss_confidence_threshold: 0.2
-    warmup_steps: 5000
-    vanilla_probability: 0.3
-    gradient_accumulation_steps: ${training.gradient_accumulation_steps}
+  target: src.trainer.vae_trainers.EQVAETrainer
+  params: {}
 
 data:
   target: src.data.datamodule.VAEDataModule
   params:
     dataset_config:
-      type: precomputed_warp
+      type: co3d
       params:
         root_dir: "/visinf/projects_students/dlcv2025_groupZ/co3d_full"
         bb_file: "data/co3d_annotations/hydrant_train_50seq.jgz"
-        warp_dir: "/visinf/projects_students/dlcv2025_groupZ/precomputed_warps/hydrant_50seq_cropped"
         image_size: ${training.image_size}
-        confidence_threshold: 0.25
+        include_plucker: false
         crop_images: true
+        apply_augmentation: false
     batch_size: ${training.batch_size}
     val_split: ${training.val_split}
     num_workers: ${training.num_workers}
@@ -76,19 +71,19 @@ training:
   val_split: 0.2
   num_epochs: 200
   lr: 1.0e-5
-  kl_weight: 0.00001
+  kl_weight: 0.0001
   lpips_loss_weight: 1.0
   ema_decay: 0.9999
   precision: 32
-  output_dir: "./outputs/warp_vae_hydrant_recon_crop"
+  output_dir: "./outputs/eqvae_hydrant_cropped"
   checkpoint_every_n_epochs: 5
   checkpoint_every_n_steps: 5000
   log_every_n_steps: 50
   gradient_accumulation_steps: 4
-  note: "hydrant 50seq cropped, from scratch, warp_w=0.1, warp_recon_w=0.1, disc_w=0.5, disc_start=15k"
+  note: "EQ-VAE on CO3D hydrant 50seq cropped, matched to warp_vae_hydrant_recon_crop runs"
 
 wandb:
   enabled: true
   project: enhanced-VAE
   entity: deep_cv
-  tags: ["warp-vae", "precomputed", "co3d", "hydrant", "warp-reconstruction", "cropped"]
+  tags: ["eqvae", "equivariance", "co3d", "hydrant", "50seq", "cropped"]

@@ -1,7 +1,7 @@
-# WARP-VAE training on CO3D hydrant with precomputed warps (CROPPED)
-# From scratch with warp consistency + WarpReconstructionLoss enabled
+# WARP-VAE training on CO3D hydrant — warp reconstruction only (no consistency loss)
+# Pretrained SD-VAE, warp_consistency_weight=0, warp_reconstruction with LPIPS
 #
-# Run: CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_hydrant_recon_crop
+# Run: CUDA_VISIBLE_DEVICES=0,1 python train.py --config-name=warp_vae_hydrant_recon_only +pretrained_weights="./weights/f8/model.ckpt"
 
 model:
   target: ldm.models.autoencoder.AutoencoderKL
@@ -37,7 +37,7 @@ trainer:
   target: src.trainer.vae_trainers.WarpVAETrainer
   params:
     target_key: "image_target"
-    warp_consistency_weight: 0.5
+    warp_consistency_weight: 0.0
     warp_reconstruction_weight: 0.02
     warp_recon_pixel_weight: 0.0
     warp_recon_perceptual_weight: 1.0
@@ -46,7 +46,7 @@ trainer:
     confidence_weighted: true
     loss_confidence_threshold: 0.2
     warmup_steps: 5000
-    vanilla_probability: 0.3
+    vanilla_probability: 0.7
     gradient_accumulation_steps: ${training.gradient_accumulation_steps}
 
 data:
@@ -76,19 +76,19 @@ training:
   val_split: 0.2
   num_epochs: 200
   lr: 1.0e-5
-  kl_weight: 0.00001
+  kl_weight: 0.0001
   lpips_loss_weight: 1.0
   ema_decay: 0.9999
   precision: 32
-  output_dir: "./outputs/warp_vae_hydrant_recon_crop"
+  output_dir: "./outputs/warp_vae_hydrant_recon_only"
   checkpoint_every_n_epochs: 5
   checkpoint_every_n_steps: 5000
   log_every_n_steps: 50
   gradient_accumulation_steps: 4
-  note: "hydrant 50seq cropped, from scratch, warp_w=0.1, warp_recon_w=0.1, disc_w=0.5, disc_start=15k"
+  note: "hydrant 50seq cropped, pretrained SD-VAE, warp_recon only (no consistency), lpips"
 
 wandb:
   enabled: true
   project: enhanced-VAE
   entity: deep_cv
-  tags: ["warp-vae", "precomputed", "co3d", "hydrant", "warp-reconstruction", "cropped"]
+  tags: ["warp-vae", "precomputed", "co3d", "hydrant", "warp-reconstruction-only", "cropped"]
