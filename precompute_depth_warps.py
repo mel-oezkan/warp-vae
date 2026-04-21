@@ -32,6 +32,8 @@ import gzip
 import json
 import os
 import random
+from functools import partial
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
 
@@ -313,8 +315,8 @@ def compute_depth_warp(
     # Depth consistency: compare reprojected depth with actual depth in B
     W_orig_b, H_orig_b = image_size_b
     H_depth_b, W_depth_b = depth_b.shape
-    u_b_depth = np.clip((u_b / W_orig_b * W_depth_b).astype(int), 0, W_depth_b - 1)
-    v_b_depth = np.clip((v_b / H_orig_b * H_depth_b).astype(int), 0, H_depth_b - 1)
+    u_b_depth = np.clip(np.nan_to_num(u_b / W_orig_b * W_depth_b, nan=0.0).astype(int), 0, W_depth_b - 1)
+    v_b_depth = np.clip(np.nan_to_num(v_b / H_orig_b * H_depth_b, nan=0.0).astype(int), 0, H_depth_b - 1)
     z_b_actual = depth_b[v_b_depth, u_b_depth]
 
     # Relative depth error (only where target depth is valid)
@@ -419,6 +421,105 @@ def select_pairs(
 # Main
 # ---------------------------------------------------------------------------
 
+def _process_pair(
+    pair: Tuple[int, int],
+    samples: List[Dict[str, Any]],
+    root_dir: Path,
+    output_dir: Path,
+    warp_resolution: int,
+    depth_consistency_threshold: float,
+    crop_images: bool,
+) -> str:
+    """Process a single pair — designed to run in a worker process."""
+    idx_a, idx_b = pair
+    output_file = output_dir / f"warp_{idx_a:05d}_{idx_b:05d}.pt"
+    if output_file.exists():
+        return "success"
+
+    sample_a = samples[idx_a]
+    sample_b = samples[idx_b]
+
+    if "depth_path" not in sample_a or "depth_path" not in sample_b:
+        return "skip"
+
+    try:
+        depth_a = load_co3d_depth(
+            str(root_dir / sample_a["depth_path"]),
+            sample_a.get("depth_scale_adjustment", 1.0),
+        )
+        depth_b = load_co3d_depth(
+            str(root_dir / sample_b["depth_path"]),
+            sample_b.get("depth_scale_adjustment", 1.0),
+        )
+
+        if "depth_mask_path" in sample_a:
+            depth_mask_a = load_co3d_depth_mask(str(root_dir / sample_a["depth_mask_path"]))
+        else:
+            depth_mask_a = (depth_a > 0) & np.isfinite(depth_a)
+
+        if "depth_mask_path" in sample_b:
+            depth_mask_b = load_co3d_depth_mask(str(root_dir / sample_b["depth_mask_path"]))
+        else:
+            depth_mask_b = (depth_b > 0) & np.isfinite(depth_b)
+
+        image_size_a = get_image_size(sample_a, root_dir)
+        image_size_b = get_image_size(sample_b, root_dir)
+
+        K_a = build_intrinsic_matrix(
+            np.array(sample_a["focal_length"]),
+            np.array(sample_a["principal_point"]),
+            image_size_a,
+        )
+        K_b = build_intrinsic_matrix(
+            np.array(sample_b["focal_length"]),
+            np.array(sample_b["principal_point"]),
+            image_size_b,
+        )
+
+        R_a = np.array(sample_a["R"])
+        T_a = np.array(sample_a["T"])
+        R_b = np.array(sample_b["R"])
+        T_b = np.array(sample_b["T"])
+
+        crop_bbox_a = get_crop_bbox(sample_a, crop_images)
+        crop_bbox_b = get_crop_bbox(sample_b, crop_images)
+
+        warp_ab, confidence_ab = compute_depth_warp(
+            depth_a, depth_mask_a, R_a, T_a, K_a,
+            depth_b, depth_mask_b, R_b, T_b, K_b,
+            warp_resolution=warp_resolution,
+            image_size_a=image_size_a,
+            image_size_b=image_size_b,
+            depth_consistency_threshold=depth_consistency_threshold,
+            crop_bbox_a=crop_bbox_a,
+            crop_bbox_b=crop_bbox_b,
+        )
+
+        warp_ba, confidence_ba = compute_depth_warp(
+            depth_b, depth_mask_b, R_b, T_b, K_b,
+            depth_a, depth_mask_a, R_a, T_a, K_a,
+            warp_resolution=warp_resolution,
+            image_size_a=image_size_b,
+            image_size_b=image_size_a,
+            depth_consistency_threshold=depth_consistency_threshold,
+            crop_bbox_a=crop_bbox_b,
+            crop_bbox_b=crop_bbox_a,
+        )
+
+        warp_data = {
+            "warp_ab": warp_ab,
+            "confidence_ab": confidence_ab,
+            "warp_ba": warp_ba,
+            "confidence_ba": confidence_ba,
+        }
+        torch.save(warp_data, output_file)
+        return "success"
+
+    except Exception as e:
+        print(f"Error for pair ({idx_a}, {idx_b}): {e}")
+        return "error"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Precompute depth-based warp fields for multi-view consistency training"
@@ -437,12 +538,12 @@ def main():
     parser.add_argument("--image_size", type=int, default=256,
                         help="Training image size (for metadata)")
     parser.add_argument(
-        "--max_camera_distance", type=float, default=1.0,
+        "--max_camera_distance", type=float, default=8.0,
         help="Maximum camera distance for pair selection (default: 1.0, "
              "smaller = closer views = less occlusion)"
     )
     parser.add_argument(
-        "--min_camera_distance", type=float, default=0.05,
+        "--min_camera_distance", type=float, default=2.0,
         help="Minimum camera distance (skip near-identical views)"
     )
     parser.add_argument(
@@ -455,6 +556,8 @@ def main():
     )
     parser.add_argument("--crop_images", action="store_true",
                         help="Crop images to square bbox (must match training config)")
+    parser.add_argument("--num_workers", type=int, default=cpu_count(),
+                        help="Number of parallel workers (default: all CPUs)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip already computed pairs")
     args = parser.parse_args()
@@ -510,109 +613,36 @@ def main():
         print("All pairs already computed!")
         return
 
-    # Compute warps
+    # Compute warps with multiprocessing
+    num_workers = min(args.num_workers, len(all_pairs))
+    print(f"Using {num_workers} workers")
+
+    worker_fn = partial(
+        _process_pair,
+        samples=samples,
+        root_dir=root_dir,
+        output_dir=output_dir,
+        warp_resolution=args.warp_resolution,
+        depth_consistency_threshold=args.depth_consistency_threshold,
+        crop_images=args.crop_images,
+    )
+
     n_success = 0
     n_skip_no_depth = 0
     n_errors = 0
 
-    for idx_a, idx_b in tqdm(all_pairs, desc="Computing depth warps"):
-        output_file = output_dir / f"warp_{idx_a:05d}_{idx_b:05d}.pt"
-        if output_file.exists():
-            continue
-
-        sample_a = samples[idx_a]
-        sample_b = samples[idx_b]
-
-        # Check depth availability
-        if "depth_path" not in sample_a or "depth_path" not in sample_b:
-            n_skip_no_depth += 1
-            continue
-
-        try:
-            # Load depth maps
-            depth_a = load_co3d_depth(
-                str(root_dir / sample_a["depth_path"]),
-                sample_a.get("depth_scale_adjustment", 1.0)
-            )
-            depth_b = load_co3d_depth(
-                str(root_dir / sample_b["depth_path"]),
-                sample_b.get("depth_scale_adjustment", 1.0)
-            )
-
-            # Load depth masks
-            if "depth_mask_path" in sample_a:
-                depth_mask_a = load_co3d_depth_mask(str(root_dir / sample_a["depth_mask_path"]))
+    with Pool(num_workers) as pool:
+        for result in tqdm(
+            pool.imap_unordered(worker_fn, all_pairs, chunksize=16),
+            total=len(all_pairs),
+            desc="Computing depth warps",
+        ):
+            if result == "success":
+                n_success += 1
+            elif result == "skip":
+                n_skip_no_depth += 1
             else:
-                depth_mask_a = (depth_a > 0) & np.isfinite(depth_a)
-
-            if "depth_mask_path" in sample_b:
-                depth_mask_b = load_co3d_depth_mask(str(root_dir / sample_b["depth_mask_path"]))
-            else:
-                depth_mask_b = (depth_b > 0) & np.isfinite(depth_b)
-
-            # Get image sizes
-            image_size_a = get_image_size(sample_a, root_dir)
-            image_size_b = get_image_size(sample_b, root_dir)
-
-            # Build intrinsic matrices
-            K_a = build_intrinsic_matrix(
-                np.array(sample_a["focal_length"]),
-                np.array(sample_a["principal_point"]),
-                image_size_a,
-            )
-            K_b = build_intrinsic_matrix(
-                np.array(sample_b["focal_length"]),
-                np.array(sample_b["principal_point"]),
-                image_size_b,
-            )
-
-            # Camera extrinsics
-            R_a = np.array(sample_a["R"])
-            T_a = np.array(sample_a["T"])
-            R_b = np.array(sample_b["R"])
-            T_b = np.array(sample_b["T"])
-
-            # Crop bboxes
-            crop_bbox_a = get_crop_bbox(sample_a, args.crop_images)
-            crop_bbox_b = get_crop_bbox(sample_b, args.crop_images)
-
-            # Compute A -> B warp
-            warp_ab, confidence_ab = compute_depth_warp(
-                depth_a, depth_mask_a, R_a, T_a, K_a,
-                depth_b, depth_mask_b, R_b, T_b, K_b,
-                warp_resolution=args.warp_resolution,
-                image_size_a=image_size_a,
-                image_size_b=image_size_b,
-                depth_consistency_threshold=args.depth_consistency_threshold,
-                crop_bbox_a=crop_bbox_a,
-                crop_bbox_b=crop_bbox_b,
-            )
-
-            # Compute B -> A warp
-            warp_ba, confidence_ba = compute_depth_warp(
-                depth_b, depth_mask_b, R_b, T_b, K_b,
-                depth_a, depth_mask_a, R_a, T_a, K_a,
-                warp_resolution=args.warp_resolution,
-                image_size_a=image_size_b,
-                image_size_b=image_size_a,
-                depth_consistency_threshold=args.depth_consistency_threshold,
-                crop_bbox_a=crop_bbox_b,
-                crop_bbox_b=crop_bbox_a,
-            )
-
-            # Save in same format as precompute_warps.py
-            warp_data = {
-                "warp_ab": warp_ab,
-                "confidence_ab": confidence_ab,
-                "warp_ba": warp_ba,
-                "confidence_ba": confidence_ba,
-            }
-            torch.save(warp_data, output_file)
-            n_success += 1
-
-        except Exception as e:
-            n_errors += 1
-            print(f"Error for pair ({idx_a}, {idx_b}): {e}")
+                n_errors += 1
 
     print(f"\nDone! {n_success} pairs computed, {n_skip_no_depth} skipped (no depth), {n_errors} errors")
 
