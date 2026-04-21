@@ -119,17 +119,19 @@ class AutoencoderKL(pl.LightningModule):
         dec = self.decoder(z)
         return dec
 
-    def forward(self, input, sample_posterior=True):
+    def forward(self, input, sample_posterior=True, return_latent=False):
         """
         Forward pass through VAE.
 
         Args:
             input: Input image tensor
             sample_posterior: Whether to sample from posterior or use mode
+            return_latent: If True, also return the sampled latent z
 
         Returns:
             dec: Reconstructed image
             posterior: Posterior distribution
+            z: (only if return_latent=True) The latent sample used for decoding
         """
         posterior = self.encode(input)
         if sample_posterior:
@@ -137,6 +139,8 @@ class AutoencoderKL(pl.LightningModule):
         else:
             z = posterior.mode()
         dec = self.decode(z)
+        if return_latent:
+            return dec, posterior, z
         return dec, posterior
 
     def get_input(self, batch, k):
