@@ -13,7 +13,7 @@ These documents describe the different approaches to improving 3D awareness in t
 | Document | Model | Summary |
 |----------|-------|---------|
 | [EQ-VAE_Implementation.md](EQ-VAE_Implementation.md) | EQ-VAE | Equivariance regularization via random scale + rotation transforms on latent codes. Probabilistic mixing of EQ-VAE, low-res, and full-res training paths. |
-| [Warp_VAE_Training.md](Warp_VAE_Training.md) | Warp VAE | Multi-view consistency via RoMA dense correspondences. Includes warp consistency loss, gradient accumulation, precomputed warp pipeline, and R1 gradient penalty details. |
+| [Warp_VAE_Training.md](Warp_VAE_Training.md) | Warp VAE, Naive Warp VAE, Depth Warp VAE | Multi-view consistency via RoMA or depth-based correspondences. Includes warp/naive/depth variants, NaiveWarpConsistencyLoss, depth warp precomputation, `return_latent` API, and experiment configs. |
 | [PluckerVAE_Variants.md](PluckerVAE_Variants.md) | Plucker VAE | Three variants (Concat, Direct, Conditioned) for integrating full-resolution Plucker ray coordinates into the VAE. Includes architecture diagrams, loss functions, and known issues. |
 
 ## Evaluation and Analysis
@@ -29,12 +29,12 @@ These documents describe the different approaches to improving 3D awareness in t
 
 | Document | Script/Tool | Summary |
 |----------|-------------|---------|
-| [ROMA_PRECOMPUTE_SPEEDUP.md](ROMA_PRECOMPUTE_SPEEDUP.md) | `precompute_warps.py` | Precompute RoMA warp fields to disk for faster training. Distance-based pair selection, multi-GPU support. |
+| [ROMA_PRECOMPUTE_SPEEDUP.md](ROMA_PRECOMPUTE_SPEEDUP.md) | `precompute_warps.py`, `precompute_depth_warps.py` | Precompute warp fields to disk (RoMA-based or depth-based). Distance-based pair selection, multi-GPU support. |
 
 ## Reading Order for New Contributors
 
 1. **QUICKSTART.md** -- Understand how to run training
-2. **Warp_VAE_Training.md** -- The primary active approach (most detailed)
+2. **Warp_VAE_Training.md** -- The primary active approach (Warp VAE, Naive Warp, Depth Warp variants)
 3. **EQ-VAE_Implementation.md** -- The equivariance approach
-4. **MultiViewConsistencyEval.md** -- How we evaluate models
+4. **MultiViewConsistencyEval.md** -- How we evaluate models (model-agnostic metrics)
 5. **PluckerVAE_Variants.md** -- Alternative geometric prior approach
