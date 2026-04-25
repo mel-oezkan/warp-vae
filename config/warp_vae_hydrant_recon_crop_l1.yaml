@@ -1,0 +1,94 @@
+# WARP-VAE training on CO3D hydrant with precomputed warps (CROPPED)
+# Same as cosine variant but with L1 consistency loss
+#
+# Run: CUDA_VISIBLE_DEVICES=0 python train.py --config-name=warp_vae_hydrant_recon_crop_l1
+
+model:
+  target: ldm.models.autoencoder.AutoencoderKL
+  params:
+    embed_dim: 4
+    monitor: val/rec_loss
+    image_key: "image"
+
+    ddconfig:
+      double_z: true
+      z_channels: 4
+      resolution: ${training.image_size}
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult: [1, 2, 4, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 2000
+        kl_weight: ${training.kl_weight}
+        disc_weight: 0.5
+        perceptual_weight: ${training.lpips_loss_weight}
+        disc_in_channels: 3
+        disc_num_layers: 2
+        use_actnorm: false
+
+trainer:
+  target: src.trainer.vae_trainers.WarpVAETrainer
+  params:
+    target_key: "image_target"
+    warp_consistency_weight: 0.02
+    warp_reconstruction_weight: 0.02
+    warp_recon_pixel_weight: 0.0
+    warp_recon_perceptual_weight: 1.0
+    consistency_loss_type: "l1"
+    bidirectional: true
+    confidence_weighted: true
+    loss_confidence_threshold: 0.2
+    warmup_steps: 5000
+    vanilla_probability: 0.7
+    gradient_accumulation_steps: ${training.gradient_accumulation_steps}
+
+data:
+  target: src.data.datamodule.VAEDataModule
+  params:
+    dataset_config:
+      type: precomputed_warp
+      params:
+        root_dir: "/visinf/projects_students/dlcv2025_groupZ/co3d_full"
+        bb_file: "data/co3d_annotations/hydrant_train_50seq.jgz"
+        warp_dir: "/visinf/projects_students/dlcv2025_groupZ/precomputed_warps/hydrant_50seq_cropped"
+        image_size: ${training.image_size}
+        confidence_threshold: 0.25
+        crop_images: true
+    batch_size: ${training.batch_size}
+    val_split: ${training.val_split}
+    num_workers: ${training.num_workers}
+    pin_memory: true
+    persistent_workers: true
+    shuffle_train: true
+    prefetch_factor: 4
+
+training:
+  batch_size: 1
+  image_size: 256
+  num_workers: 4
+  val_split: 0.2
+  num_epochs: 200
+  lr: 1.0e-5
+  kl_weight: 0.0001
+  lpips_loss_weight: 1.0
+  ema_decay: 0.9999
+  precision: 32
+  output_dir: "./outputs/warp_vae_hydrant_recon_crop_l1"
+  checkpoint_every_n_epochs: 5
+  checkpoint_every_n_steps: 5000
+  log_every_n_steps: 50
+  gradient_accumulation_steps: 4
+  note: "hydrant 50seq cropped, from scratch, warp_w=0.02, warp_recon_w=0.02, disc_w=0.5, l1 warp consistency"
+
+wandb:
+  enabled: true
+  project: enhanced-VAE
+  entity: deep_cv
+  tags: ["warp-vae", "precomputed", "co3d", "hydrant", "warp-reconstruction", "cropped", "l1"]

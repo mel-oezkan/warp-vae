@@ -1,0 +1,34 @@
+training:
+  image_size: 256
+  val_size: 0.1
+  # ema_decay: 0
+  ema_decay: 0.999
+  batch_size: 2
+  lr: 0.00002
+  num_epochs: 20
+  kl_weight: 0
+  lpips_loss_weight: 1.0 
+  plucker_loss_weight: 0.1
+  precision: 16
+  output_dir: "./outputs"
+  note: "default"
+
+wanddb:
+  enabled: true
+  project: enhanced-VAE
+  entity: deep_cv
+  tags: ["vae", "finetuning", "stable-diffusion"]
+
+data:
+  dataset_type: "omniobject"  # "co3d" or "omniobject"
+
+  # For OmniObject dataset
+  data_dir: "/data/lab_moezkan/omni_obj/blender_renders_24_views"
+  pair_sampling: "sequential"  # "sequential", "random", or "fixed_interval"
+  patch_num: 8
+
+  # For CO3D dataset
+  co3d_dir: "/data/lab_moezkan/co3d_full"
+  bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
+  apply_augmentation: true
+  crop_images: true

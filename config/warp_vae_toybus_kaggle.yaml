@@ -1,0 +1,91 @@
+# Warp VAE 256x256 on CO3D toybus — adapted for Kaggle (T4/P100 16GB)
+# Self-contained: download data, precompute warps, train — all in one notebook.
+#
+# Run: cd /kaggle/working/warp_vae_kaggle && python train.py --config-name=warp_vae_toybus_kaggle hydra.run.dir=/kaggle/working/hydra_out
+
+model:
+  target: ldm.models.autoencoder.AutoencoderKL
+  params:
+    embed_dim: 4
+    monitor: val/rec_loss
+    image_key: "image"
+
+    ddconfig:
+      double_z: true
+      z_channels: 4
+      resolution: ${training.image_size}
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult: [1, 2, 4, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 0
+        kl_weight: ${training.kl_weight}
+        disc_weight: 0.5
+        perceptual_weight: ${training.lpips_loss_weight}
+        disc_in_channels: 3
+        disc_num_layers: 3
+        use_actnorm: false
+
+trainer:
+  target: src.trainer.vae_trainers.WarpVAETrainer
+  params:
+    target_key: "image_target"
+    warp_consistency_weight: 0.1
+    warp_reconstruction_weight: 0.1
+    warp_recon_pixel_weight: 0.0
+    warp_recon_perceptual_weight: 1.0
+    consistency_loss_type: "l1"
+    bidirectional: true
+    confidence_weighted: true
+    loss_confidence_threshold: 0.2
+    warmup_steps: 5000
+    vanilla_probability: 0.3
+    gradient_accumulation_steps: ${training.gradient_accumulation_steps}
+
+data:
+  target: src.data.datamodule.VAEDataModule
+  params:
+    dataset_config:
+      type: precomputed_warp
+      params:
+        root_dir: "/kaggle/working/co3d_data"
+        bb_file: "/kaggle/working/annotations/toybus_train.jgz"
+        warp_dir: "/kaggle/working/warps/toybus"
+        image_size: ${training.image_size}
+        confidence_threshold: 0.25
+        crop_images: false
+    batch_size: ${training.batch_size}
+    val_split: ${training.val_split}
+    num_workers: ${training.num_workers}
+    pin_memory: true
+    persistent_workers: true
+    shuffle_train: true
+    prefetch_factor: 2
+
+training:
+  batch_size: 2
+  image_size: 256
+  num_workers: 2
+  val_split: 0.2
+  num_epochs: 20
+  lr: 4.5e-6
+  kl_weight: 0.000001
+  lpips_loss_weight: 1.0
+  ema_decay: 0.9999
+  precision: "16-mixed"
+  output_dir: "/kaggle/working/outputs"
+  checkpoint_every_n_epochs: 5
+  checkpoint_every_n_steps: 5000
+  log_every_n_steps: 50
+  gradient_accumulation_steps: 4
+  note: "toybus-256-kaggle"
+
+wandb:
+  enabled: false

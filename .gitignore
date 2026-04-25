@@ -1,11 +1,44 @@
-data/
+# Data
+/data/*
+
+# Build artifacts
 pretrained/
-uv.lock
-__pycache__
-__pycache__/*
-*/__pycache__
+__pycache__/
+**/__pycache__/
 *.pyc
-.venv
+.venv/
 .python-version
+
+# Outputs
 latent_batches/
-pyproject.toml
+model_storage/
+output/
+outputs/
+lightning_logs/
+evaluation_outputs/
+eval_outputs/
+checkpoints/
+weights/
+sd_model/
+sd21_vae_local/
+vae-finetuning/
+
+# Tools / IDE
+.claude/
+.gitmodules/
+.log
+wandb/
+
+# Notebooks
+*.ipynb
+evaluation/notebooks/*
+
+# Generated images / archives
+*.png
+*.zip
+
+# Docs
+docs/report/
+
+# Build
+kaggle_build/*

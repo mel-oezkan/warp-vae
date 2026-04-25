@@ -1,0 +1,78 @@
+model:
+  target: ldm.models.autoencoder.AutoencoderKL
+  params:
+    embed_dim: 4
+    monitor: val/rec_loss
+    image_key: "image"
+
+    ddconfig:
+      double_z: true
+      z_channels: 4
+      resolution: 256
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult: [1, 2, 4, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 50001
+        kl_weight: 0.000001
+        disc_weight: 0.5
+        perceptual_weight: 1.0
+        disc_in_channels: 3
+        disc_num_layers: 3
+        use_actnorm: false
+
+trainer:
+  target: src.trainer.vae_trainers.VanillaVAETrainer
+
+data:
+  target: src.data.datamodule.VAEDataModule
+  params:
+    dataset_config:
+      type: co3d
+      params:
+        root_dir: ${data.co3d_dir}
+        bb_file: ${data.bb_file}
+        image_size: ${training.image_size}
+        include_plucker: false
+        crop_images: true
+        apply_augmentation: false
+    batch_size: ${training.batch_size}
+    val_split: ${training.val_split}
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    shuffle_train: true
+
+# Data paths (override these in command line or environment)
+co3d_dir: "/data/lab_moezkan/co3d_full/toybus"
+bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
+
+# Optional: Path to pretrained weights (e.g., Stable Diffusion checkpoint)
+# pretrained_weights: "./sd_model/v1-5-pruned.ckpt"
+
+training:
+  batch_size: 8
+  image_size: 256
+  num_epochs: 100
+  lr: 4.5e-6
+  kl_weight: 0.000001
+  lpips_loss_weight: 1.0
+  disc_lr: 4.5e-6
+  ema_decay: 0.9999
+  val_split: 0.1
+  precision: 16
+  output_dir: "./outputs/vanilla_vae_co3d"
+  note: "Vanilla VAE on CO3D"
+
+wandb:
+  enabled: true
+  project: enhanced-VAE
+  entity: deep_cv
+  tags: ["vanilla-vae", "co3d", "baseline"]

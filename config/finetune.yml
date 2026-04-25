@@ -1,0 +1,22 @@
+backbone: small
+reg: False
+
+hydra:
+  run:
+    dir: checkpoints/${backbone}-${reg}-singlerun
+
+  sweep:
+    dir: checkpoints
+    subdir: ${backbone}-${reg}
+  
+
+data:
+  dataset_type: "co3d"  # or "face"
+  # For face dataset
+  data_dir: "/path/to/face/data"
+  # For CO3D dataset
+  co3d_dir: "/data/lab_moezkan/co3d_full"
+  bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz",
+  apply_augmentation: false
+  crop_images: false
+  patch_num: 8

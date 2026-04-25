@@ -1,0 +1,90 @@
+# Memory-efficient Warp VAE config for testing on limited GPU memory
+# Reduced model capacity for GTX 1080 Ti (11GB VRAM)
+
+model:
+  target: ldm.models.autoencoder.AutoencoderKL
+  params:
+    embed_dim: 4
+    monitor: val/rec_loss
+    image_key: "image"
+
+    ddconfig:
+      double_z: true
+      z_channels: 4
+      resolution: ${training.image_size}
+      in_channels: 3
+      out_ch: 3
+      ch: 64                              # Reduced from 128
+      ch_mult: [1, 2, 4]                  # Reduced from [1, 2, 4, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 50001
+        kl_weight: ${training.kl_weight}
+        disc_weight: 0.5
+        perceptual_weight: ${training.lpips_loss_weight}
+        disc_in_channels: 3
+        disc_num_layers: 2                # Reduced from 3
+        use_actnorm: false
+
+trainer:
+  target: src.trainer.vae_trainers.WarpVAETrainer
+  params:
+    target_key: "image_target"
+    warp_consistency_weight: 1.0
+    warp_reconstruction_weight: 0.0
+    consistency_loss_type: "l1"
+    bidirectional: true
+    confidence_weighted: true
+    loss_confidence_threshold: 0.1
+    warmup_steps: 1000
+    vanilla_probability: 0.2
+    gradient_accumulation_steps: ${training.gradient_accumulation_steps}
+
+data:
+  target: src.data.datamodule.VAEDataModule
+  params:
+    dataset_config:
+      type: warp_co3d
+      params:
+        root_dir: "/data/lab_moezkan/co3d_full"
+        bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
+        image_size: ${training.image_size}
+        romav2_setting: "turbo"
+        pair_sampling: "random"
+        max_pair_distance: 10
+        warp_resolution: ${training.image_size}
+        warp_confidence_threshold: 0.75
+        include_plucker: false
+    batch_size: ${training.batch_size}
+    val_split: ${training.val_split}
+    num_workers: ${training.num_workers}
+    pin_memory: false
+    persistent_workers: false
+    shuffle_train: true
+
+training:
+  batch_size: 8
+  image_size: 128
+  num_workers: 0                          # Must be 0 for RoMaV2 (CUDA in dataloader workers)
+  val_split: 0.25
+  num_epochs: 20
+  lr: 4.5e-6
+  kl_weight: 0.000001
+  lpips_loss_weight: 1.0
+  ema_decay: 0.9999
+  precision: 16
+  output_dir: "./outputs/warp_vae_co3d_small"
+  checkpoint_every_n_epochs: 2
+  log_every_n_steps: 10
+  gradient_accumulation_steps: 1          # Accumulate gradients over N batches before updating
+
+wandb:
+  enabled: true
+  project: enhanced-VAE
+  entity: deep_cv
+  tags: ["warp-vae", "romav2", "co3d", "small-model", "test"]

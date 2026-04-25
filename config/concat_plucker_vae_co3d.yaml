@@ -1,0 +1,121 @@
+# ConcatPluckerVAE (Variant 1) Configuration
+#
+# Most complex variant with disentangled latent spaces:
+# - Three separate latent distributions: image (z_img), direction (z_d), moment (z_m)
+# - Encoder-side Plucker prediction head (auxiliary supervision)
+# - Three decoder output heads for image, direction, and moment
+# - Three KL divergence terms
+
+model:
+  target: ldm.models.autoencoder.ConcatPluckerVAE
+  params:
+    embed_dim: 4
+    monitor: val/rec_loss
+    image_key: "image"
+    plucker_key: "plucker_coords"
+
+    # Latent dimensions
+    latent_dim_img: 4
+    latent_dim_d: 3
+    latent_dim_m: 3
+
+    # Loss weights
+    img_recon_weight: 1.0
+    d_recon_weight: 0.5
+    m_recon_weight: 0.5
+    encoder_plucker_weight: 0.3
+    plucker_constraint_weight: 0.1
+
+    # Encoder Plucker head config
+    n_patches: 8
+    plucker_hidden_dim: 512
+    plucker_dropout: 0.1
+
+    ddconfig:
+      double_z: true
+      z_channels: 4
+      resolution: 256
+      in_channels: 9  # 3 (image) + 6 (plucker)
+      out_ch: 3       # Image output only (d, m via separate heads)
+      ch: 128
+      ch_mult: [1, 2, 4, 4]
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+
+    lossconfig:
+      target: ldm.modules.losses.LPIPSWithDiscriminator
+      params:
+        disc_start: 50001
+        kl_weight: 0.000001
+        disc_weight: 0.5
+        perceptual_weight: 1.0
+        disc_in_channels: 3
+        disc_num_layers: 3
+        use_actnorm: false
+
+trainer:
+  target: src.trainer.vae_trainers.ConcatPluckerVAETrainer
+  params:
+    plucker_key: "plucker_coords"
+    # Loss weights
+    img_recon_weight: 1.0
+    d_recon_weight: 0.5
+    m_recon_weight: 0.5
+    encoder_plucker_weight: 0.3
+    plucker_constraint_weight: 0.1
+    # KL weights
+    kl_weight_img: 0.000001
+    kl_weight_d: 0.000001
+    kl_weight_m: 0.000001
+
+data:
+  target: src.data.datamodule.VAEDataModule
+  params:
+    dataset_config:
+      type: co3d
+      params:
+        root_dir: ${data.co3d_dir}
+        bb_file: ${data.bb_file}
+        image_size: ${training.image_size}
+        include_plucker: true
+        full_resolution_plucker: true
+        crop_images: true
+        apply_augmentation: false
+    batch_size: ${training.batch_size}
+    val_split: ${training.val_split}
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    shuffle_train: true
+
+# Data paths
+co3d_dir: "/data/lab_moezkan/co3d_full"
+bb_file: "/data/lab_moezkan/co3d_bboxes/toybus_test.jgz"
+
+training:
+  batch_size: 2  # Reduced due to increased memory usage
+  image_size: 256
+  num_epochs: 100
+  lr: 4.5e-6
+  kl_weight: 0.000001
+  lpips_loss_weight: 1.0
+  disc_lr: 4.5e-6
+  ema_decay: 0.9999
+  val_split: 0.1
+  precision: 16
+  output_dir: "./outputs/concat_plucker_vae_co3d"
+  note: "ConcatPluckerVAE (Variant 1) - Disentangled latent spaces"
+
+  # Loss weights
+  img_recon_weight: 1.0
+  d_recon_weight: 0.5
+  m_recon_weight: 0.5
+  encoder_plucker_weight: 0.3
+  plucker_constraint_weight: 0.1
+
+wandb:
+  enabled: true
+  project: enhanced-VAE
+  entity: deep_cv
+  tags: ["concat-plucker-vae", "variant-1", "disentangled", "co3d"]
