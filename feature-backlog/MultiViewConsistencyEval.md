@@ -1,3 +1,4 @@
+# TODO: Delete this
 # CO3D Multi-View Latent Consistency Evaluation
 
 ## Overview
@@ -140,6 +141,25 @@ python preprocess_co3d.py \
     --co3d_v2_dir /visinf/projects_students/dlcv2025_groupZ/co3d_full \
     --output_dir /visinf/projects_students/dlcv2025_groupZ/co3d_annotations
 ```
+
+## Reconstruction Metrics
+
+The `ReconstructionMetrics` class (`evaluation/metrics/reconstruction_metrics.py`) has been refactored to be model-agnostic:
+
+- **Old API**: `ReconstructionMetrics(model, device)` — tightly coupled to a specific model
+- **New API**: `ReconstructionMetrics(device, reconstruct_fn=None)` — accepts any VAE variant via callback
+
+```python
+# Default: model(images)[0]
+metrics = ReconstructionMetrics(device)
+results = metrics.compute(dataloader, model)
+
+# Custom reconstruction for WarpVAE or NaiveWarpVAE:
+metrics = ReconstructionMetrics(device, reconstruct_fn=lambda m, imgs: my_reconstruct(m, imgs))
+results = metrics.compute(dataloader, model)
+```
+
+This allows evaluating any trainer variant (WarpVAE, NaiveWarpVAE, etc.) without modifying the metrics module.
 
 ## Implementation
 
