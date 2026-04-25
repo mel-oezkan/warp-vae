@@ -130,6 +130,35 @@ python train.py --config-name=eqvae_omniobject_small \
 
 ---
 
+### 5. Warp VAE on CO3D (Multi-View Consistency)
+
+Train with warp consistency loss using precomputed RoMA correspondences:
+
+```bash
+python train.py --config-name=warp_vae_hydrant_recon_crop
+```
+
+**What it does**:
+- Model: Standard AutoencoderKL with warp consistency + reconstruction losses
+- Dataset: CO3D with precomputed RoMA warps
+- Losses: Reconstruction + KL + Perceptual + Warp Consistency + Warp Reconstruction
+
+**Variants**:
+```bash
+# Reconstruction loss only (ablation, no consistency loss)
+python train.py --config-name=warp_vae_hydrant_recon_only
+
+# Naive warp (EQ-VAE-style equivariance)
+python train.py --config-name=naive_warp_vae_hydrant
+
+# Depth-based warps (ground-truth geometry instead of RoMA)
+python train.py --config-name=depth_warp_vae_hydrant
+```
+
+**Prerequisite**: Precompute warps first (see [ROMA_PRECOMPUTE_SPEEDUP.md](ROMA_PRECOMPUTE_SPEEDUP.md) or [Warp_VAE_Training.md](Warp_VAE_Training.md) for depth-based warps).
+
+---
+
 ## Loading Pretrained Weights
 
 Start from Stable Diffusion VAE checkpoint:
@@ -367,6 +396,6 @@ Approximate GPU Memory = Base Model + (Batch Size × Image Memory)
 
 ## Further Reading
 
-- **Model Variants**: See [EQ-VAE_Implementation.md](EQ-VAE_Implementation.md), [Warp_VAE_Training.md](Warp_VAE_Training.md), [PluckerVAE_Variants.md](PluckerVAE_Variants.md)
+- **Model Variants**: See [EQ-VAE_Implementation.md](EQ-VAE_Implementation.md), [Warp_VAE_Training.md](Warp_VAE_Training.md) (includes Naive Warp + Depth Warp variants), [PluckerVAE_Variants.md](PluckerVAE_Variants.md)
 - **Evaluation**: See [MultiViewConsistencyEval.md](MultiViewConsistencyEval.md)
 - **Documentation Index**: See [README.md](README.md)
