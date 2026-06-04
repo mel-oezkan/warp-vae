@@ -15,6 +15,7 @@ These documents describe the different approaches to improving 3D awareness in t
 | [EQ-VAE_Implementation.md](EQ-VAE_Implementation.md) | EQ-VAE | Equivariance regularization via random scale + rotation transforms on latent codes. Probabilistic mixing of EQ-VAE, low-res, and full-res training paths. |
 | [Warp_VAE_Training.md](Warp_VAE_Training.md) | Warp VAE, Naive Warp VAE, Depth Warp VAE | Multi-view consistency via RoMA or depth-based correspondences. Includes warp/naive/depth variants, NaiveWarpConsistencyLoss, depth warp precomputation, `return_latent` API, and experiment configs. |
 | [PluckerVAE_Variants.md](PluckerVAE_Variants.md) | Plucker VAE | Three variants (Concat, Direct, Conditioned) for integrating full-resolution Plucker ray coordinates into the VAE. Includes architecture diagrams, loss functions, and known issues. |
+| [SmoothAP_VAE.md](SmoothAP_VAE.md) | SmoothAP VAE | Standalone, paper-faithful port of arXiv:2411.19458: a SmoothAP ranking loss over RoMA point correspondences. Finetunes SD KL-f8; ranks corresponding points highest among all view-B patches. Includes consistency metrics and model-parallel RoMA. |
 
 ## Evaluation and Analysis
 
