@@ -16,10 +16,24 @@ Improving the 3D awareness of 2D Variational Autoencoders by injecting geometric
 ## Setup
 
 ```bash
-git clone --recurse-submodules https://github.com/mel-oezkan/computer-vision-proj-lab.git
-cd computer-vision-proj-lab
+git clone https://github.com/mel-oezkan/warp-vae.git
+cd warp-vae
 conda activate cv
 ```
+
+### External Dependencies (`third_party/`)
+
+`third_party/ldm` and `third_party/taming` are vendored in this repo. The two
+larger upstream dependencies -- **RoMA V2** and **CO3D** -- are *not* committed;
+fetch them (pinned to the commits this project was developed against) with:
+
+```bash
+bash scripts/setup_third_party.sh
+```
+
+This clones `third_party/RoMA2` and `third_party/co3d`. They must be importable
+on `PYTHONPATH` (the `cv` conda env adds `third_party/` and `third_party/RoMA2/src`
+via a `.pth` file in its site-packages).
 
 ### Dataset Preparation
 
