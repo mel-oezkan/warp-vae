@@ -1061,7 +1061,7 @@ data:
 
 The 4-category dataset at `/visinf/projects_students/dlcv2025_groupZ/co3d` contains 48 sequences per category (backpack, bench, car, toyplane) downloaded from CO3Dv2. Setup steps:
 
-1. **Download** (already done via `scripts/download_co3d.sh`): images, depths, masks
+1. **Download** (already done via `scripts/shell/download_co3d.sh`): images, depths, masks
 2. **Download annotations**: `frame_annotations.jgz` and `sequence_annotations.jgz` are inside the `_000.zip` file for each category — extract them to the category directory
 3. **Preprocess**: `python preprocess_co3d.py --category <cat> --co3d_v2_dir .../co3d --output_dir data/co3d_annotations`
 4. **Combine**: Merge per-category train annotations into `4cat_train_depth.jgz` (prefix sequence keys with category name to avoid collisions)

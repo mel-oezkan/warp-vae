@@ -2,7 +2,7 @@
 
 ## Overview
 
-Created `scripts/visualize_roma_warps.py` - a visualization tool for RoMA correspondences, confidence maps, and VAE latent embeddings for multi-view image pairs.
+Created `scripts/visualization/visualize_roma_warps.py` - a visualization tool for RoMA correspondences, confidence maps, and VAE latent embeddings for multi-view image pairs.
 
 ## Purpose
 
@@ -17,7 +17,7 @@ Generate presentation-ready visualizations showing:
 
 ```bash
 conda activate cv
-python scripts/visualize_roma_warps.py
+python scripts/visualization/visualize_roma_warps.py
 ```
 
 ## Configuration

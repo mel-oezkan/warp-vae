@@ -21,10 +21,10 @@ These documents describe the different approaches to improving 3D awareness in t
 
 | Document | Script/Tool | Summary |
 |----------|-------------|---------|
-| [MultiViewConsistencyEval.md](MultiViewConsistencyEval.md) | `scripts/analyze_multiview_latent_consistency.py` | Measures latent consistency across viewpoints on CO3D/OmniObject3D. Supports global and RoMA-based analysis modes. |
+| [MultiViewConsistencyEval.md](MultiViewConsistencyEval.md) | `scripts/analysis/analyze_multiview_latent_consistency.py` | Measures latent consistency across viewpoints on CO3D/OmniObject3D. Supports global and RoMA-based analysis modes. |
 | [roma_region_metrics.md](roma_region_metrics.md) | (same script, RoMA mode) | Region-based metrics using dense correspondences to compare only overlapping 3D regions. Explains min-pooling, bidirectional averaging, and expected results. |
-| [ROMA_VISUALIZATION.md](ROMA_VISUALIZATION.md) | `scripts/visualize_roma_warps.py` | Generates per-pair visualizations of RoMA warps, confidence maps, PCA-projected latents, and difference maps. |
-| [warp_quality_evaluation.md](warp_quality_evaluation.md) | `scripts/visualize_distance_sampling.py` | Evaluates RoMA warp quality at different camera distance ranges. Use before running full precomputation. |
+| [ROMA_VISUALIZATION.md](ROMA_VISUALIZATION.md) | `scripts/visualization/visualize_roma_warps.py` | Generates per-pair visualizations of RoMA warps, confidence maps, PCA-projected latents, and difference maps. |
+| [warp_quality_evaluation.md](warp_quality_evaluation.md) | `scripts/visualization/visualize_distance_sampling.py` | Evaluates RoMA warp quality at different camera distance ranges. Use before running full precomputation. |
 
 ## Data Pipeline
 

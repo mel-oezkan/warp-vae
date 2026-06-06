@@ -88,7 +88,7 @@ The warp field is downsampled using bilinear interpolation. The confidence mask 
 
 ```bash
 # RoMA mode only
-python scripts/analyze_multiview_latent_consistency.py \
+python scripts/analysis/analyze_multiview_latent_consistency.py \
     --checkpoints weights/f8/model.ckpt \
     --configs config/baseVAE.yaml \
     --model_names "Baseline" \
@@ -98,7 +98,7 @@ python scripts/analyze_multiview_latent_consistency.py \
     --output_name roma_analysis
 
 # Both global and RoMA analysis
-python scripts/analyze_multiview_latent_consistency.py \
+python scripts/analysis/analyze_multiview_latent_consistency.py \
     --checkpoints model1.ckpt model2.ckpt \
     --configs config1.yaml config2.yaml \
     --model_names "Model A" "Model B" \

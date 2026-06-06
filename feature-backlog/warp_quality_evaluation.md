@@ -1,6 +1,6 @@
 # Warp Quality Evaluation
 
-Script: `scripts/visualize_distance_sampling.py`
+Script: `scripts/visualization/visualize_distance_sampling.py`
 
 Evaluates RoMA warp quality for CO3D image pairs at a given camera distance
 range. For each pair it computes bidirectional warps, measures pixel-space MSE,
@@ -13,18 +13,18 @@ running `precompute_warps.py` on the full dataset.
 
 ```bash
 # Default: hydrant pairs at distance 2-5, fast RoMA
-python scripts/visualize_distance_sampling.py
+python scripts/visualization/visualize_distance_sampling.py
 
 # Custom distance range
-python scripts/visualize_distance_sampling.py --distance_min 1.5 --distance_max 4.0
+python scripts/visualization/visualize_distance_sampling.py --distance_min 1.5 --distance_max 4.0
 
 # More samples
-python scripts/visualize_distance_sampling.py --num_sequences 20 --pairs_per_sequence 5
+python scripts/visualization/visualize_distance_sampling.py --num_sequences 20 --pairs_per_sequence 5
 
-python scripts/visualize_distance_sampling.py --distance_min 1.5 --distance_max 2.0 --num_sequences 20 --pairs_per_sequence 5
+python scripts/visualization/visualize_distance_sampling.py --distance_min 1.5 --distance_max 2.0 --num_sequences 20 --pairs_per_sequence 5
 
 # Use precise RoMA (needs expandable_segments on 1080 Ti)
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/visualize_distance_sampling.py --roma_setting precise
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python scripts/visualization/visualize_distance_sampling.py --roma_setting precise
 ```
 
 ## Arguments

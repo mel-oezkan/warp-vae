@@ -95,7 +95,7 @@ python train.py --config-name=vanilla_vae_co3d \
 Measure multi-view latent consistency across viewpoints:
 
 ```bash
-python scripts/analyze_multiview_latent_consistency.py \
+python scripts/analysis/analyze_multiview_latent_consistency.py \
     --checkpoints <ckpt_path> \
     --configs <config_name>
 ```

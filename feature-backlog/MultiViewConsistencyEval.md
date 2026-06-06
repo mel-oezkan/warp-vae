@@ -3,7 +3,7 @@
 
 ## Overview
 
-The evaluation script `scripts/analyze_multiview_latent_consistency.py` now supports CO3D alongside OmniObject3D. It measures how consistent VAE latent representations are across different viewpoints of the same scene, using CO3D hydrant sequences as test data.
+The evaluation script `scripts/analysis/analyze_multiview_latent_consistency.py` now supports CO3D alongside OmniObject3D. It measures how consistent VAE latent representations are across different viewpoints of the same scene, using CO3D hydrant sequences as test data.
 
 ## What it does
 
@@ -59,7 +59,7 @@ The script now uses `--checkpoints`, `--configs`, and `--model_names` to compare
 
 ```bash
 # Single model evaluation
-python scripts/analyze_multiview_latent_consistency.py \
+python scripts/analysis/analyze_multiview_latent_consistency.py \
     --checkpoints checkpoints/massive-accurate-okapi-of-blizzard/last.ckpt \
     --configs config/warp_vae_co3d_precomputed.yaml \
     --model_names "WARP-VAE" \
@@ -67,7 +67,7 @@ python scripts/analyze_multiview_latent_consistency.py \
     --num_objects 50
 
 # Full 3-model comparison with RoMA on CO3D (recommended)
-python scripts/analyze_multiview_latent_consistency.py \
+python scripts/analysis/analyze_multiview_latent_consistency.py \
     --dataset co3d \
     --checkpoints \
         checkpoints/massive-accurate-okapi-of-blizzard/last.ckpt \
@@ -85,7 +85,7 @@ python scripts/analyze_multiview_latent_consistency.py \
     --output_name full_comparison_co3d
 
 # RoMA mode with precise setting and confidence filtering
-python scripts/analyze_multiview_latent_consistency.py \
+python scripts/analysis/analyze_multiview_latent_consistency.py \
     --checkpoints weights/f8/model.ckpt \
     --configs config/baseVAE.yaml \
     --model_names "Baseline" \
@@ -95,7 +95,7 @@ python scripts/analyze_multiview_latent_consistency.py \
     --output_name roma_analysis
 
 # Both global and RoMA analysis
-python scripts/analyze_multiview_latent_consistency.py \
+python scripts/analysis/analyze_multiview_latent_consistency.py \
     --checkpoints model1.ckpt model2.ckpt \
     --configs config1.yaml config2.yaml \
     --model_names "Model A" "Model B" \

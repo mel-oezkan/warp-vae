@@ -63,7 +63,7 @@ Only pairs with `distance_min <= dist <= distance_max` are computed. This
 avoids near-duplicate views and views with too little overlap, producing
 better-quality training pairs than frame-index proximity.
 
-Use `scripts/visualize_distance_sampling.py` to inspect warp quality at
+Use `scripts/visualization/visualize_distance_sampling.py` to inspect warp quality at
 different distance ranges before running a large precomputation job.
 
 ## Performance Expectations

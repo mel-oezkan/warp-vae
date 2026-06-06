@@ -63,4 +63,4 @@ feature-backlog/                  # Design documents (see feature-backlog/README
 1. Preprocess data: `python preprocess_co3d.py --category hydrant`
 2. (Optional) Precompute warps: `python precompute_warps.py --annotation_file ...`
 3. Train: `python train.py --config-name=<config>`
-4. Evaluate: `python scripts/analyze_multiview_latent_consistency.py --checkpoints ... --configs ...`
+4. Evaluate: `python scripts/analysis/analyze_multiview_latent_consistency.py --checkpoints ... --configs ...`

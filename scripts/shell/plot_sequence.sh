@@ -1,0 +1,11 @@
+source /visinf/home/lab_mozkan/miniconda3/etc/profile.d/conda.sh && conda activate cv && CUDA_VISIBLE_DEVICES=0 python scripts/analysis/analyze_multiview_latent_consistency.py \
+    --checkpoints "checkpoints/garrulous-beige-rabbit-of-focus_Run B: same as A but vanilla_prob=0.3/last.ckpt" \
+    --configs config/warp_vae_hydrant_recon_small_b.yaml \
+    --model_names "Warp-VAE (Run B)" \
+    --compare_baseline \
+    --dataset co3d \
+    --image_size 128 \
+    --output_name sequence_sdvae_vs_runB \
+    --num_objects 5 \
+    --num_detailed_objects 5 \
+    --mode global
