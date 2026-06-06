@@ -241,6 +241,17 @@ def main(cfg: DictConfig):
             training_device = cfg.training.get('training_device', 0)
             print(f"[INFO] Model parallelism: VAE on cuda:{training_device}, RoMaV2 on {romav2_device}")
 
+    # Trainer-level model parallelism (e.g. SmoothAPCorrVAETrainer runs RoMA in
+    # the training step on a separate GPU). When roma_device is set, train the
+    # VAE single-process so DDP does not also occupy the RoMA GPU.
+    if not force_single_gpu and hasattr(cfg, 'trainer'):
+        trainer_params = cfg.trainer.get('params', {})
+        roma_device = trainer_params.get('roma_device', None)
+        if roma_device:
+            force_single_gpu = True
+            training_device = cfg.training.get('training_device', 0)
+            print(f"[INFO] Model parallelism: VAE on cuda:{training_device}, RoMA on {roma_device}")
+
     n_gpus, devices, strategy = get_device_config(force_single_gpu, training_device)
     print(f"[INFO] Using devices: {devices}, Strategy: {strategy}")
 
