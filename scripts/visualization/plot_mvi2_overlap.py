@@ -182,10 +182,34 @@ def point_set(img):
     return set(int(p) for p in img["p3d"] if p != -1)
 
 
-def auto_pick_pair(images):
-    """Pick the most informative partial-overlap pair (balanced unique parts)."""
+def auto_pick_pair(images, target_iou=None):
+    """Pick a frame pair automatically.
+
+    target_iou is None -> the most informative partial-overlap pair (IoU in the
+    0.25-0.4 band with balanced unique parts). Otherwise, the pair whose IoU is
+    closest to target_iou (e.g. 0.8 for a high-overlap example).
+    """
     names = sorted(images)
     sets = {n: point_set(images[n]) for n in names}
+
+    if target_iou is not None:
+        best = None  # (abs_dist, name_a, name_b)
+        for i, a in enumerate(names):
+            sa = sets[a]
+            if not sa:
+                continue
+            for b in names[i + 1 :]:
+                sb = sets[b]
+                if not sb:
+                    continue
+                iou = len(sa & sb) / len(sa | sb)
+                dist = abs(iou - target_iou)
+                if best is None or dist < best[0]:
+                    best = (dist, a, b)
+        if best is None:
+            raise SystemExit("no frame pair with shared 3D points found")
+        return best[1], best[2]
+
     best = None
     for i, a in enumerate(names):
         sa = sets[a]
@@ -385,6 +409,10 @@ def parse_args():
                    help="[pair] Name of frame A in COLMAP (e.g. images/002.jpg).")
     p.add_argument("--image_b", type=str, default=None,
                    help="[pair] Name of frame B (e.g. images/030.jpg).")
+    p.add_argument("--target-iou", dest="target_iou", type=float, default=None,
+                   help="[pair] Auto-pick the pair whose overlap (IoU) is closest "
+                        "to this value (e.g. 0.8). Ignored if --image_a/--image_b "
+                        "are given. Default: most informative partial-overlap pair.")
     p.add_argument("--out", type=str, default=None,
                    help="[pair] Output PNG. Default: "
                         "outputs/scripts/mvi2_overlap/overlap_<A>_<B>.png")
@@ -578,8 +606,9 @@ def main():
     if args.image_a and args.image_b:
         name_a, name_b = args.image_a, args.image_b
     else:
-        name_a, name_b = auto_pick_pair(images)
-        print(f"auto-selected pair: {name_a}  <->  {name_b}")
+        name_a, name_b = auto_pick_pair(images, args.target_iou)
+        tgt = f" (target IoU={args.target_iou})" if args.target_iou is not None else ""
+        print(f"auto-selected pair{tgt}: {name_a}  <->  {name_b}")
 
     for n in (name_a, name_b):
         if n not in images:
