@@ -410,9 +410,11 @@ def parse_args():
     p.add_argument("--image_b", type=str, default=None,
                    help="[pair] Name of frame B (e.g. images/030.jpg).")
     p.add_argument("--target-iou", dest="target_iou", type=float, default=None,
-                   help="[pair] Auto-pick the pair whose overlap (IoU) is closest "
-                        "to this value (e.g. 0.8). Ignored if --image_a/--image_b "
-                        "are given. Default: most informative partial-overlap pair.")
+                   help="Target overlap (IoU), e.g. 0.8. [pair] picks the pair "
+                        "closest to it (ignored if --image_a/--image_b given). "
+                        "[classes] centers the three columns on it "
+                        "(target-0.1 / target / target+0.1) instead of high/mid/low. "
+                        "Default: most informative pair / per-object quantiles.")
     p.add_argument("--out", type=str, default=None,
                    help="[pair] Output PNG. Default: "
                         "outputs/scripts/mvi2_overlap/overlap_<A>_<B>.png")
@@ -460,11 +462,13 @@ def discover_objects(root, num_classes, min_images=20):
     return out
 
 
-def pick_pairs_by_overlap(images, levels=("high", "mid", "low")):
+def pick_pairs_by_overlap(images, levels=("high", "mid", "low"), target_iou=None):
     """Pick one frame pair per overlap level, spread over this object.
 
-    Targets are per-object IoU quantiles (so "high/mid/low" adapt to whatever
-    range the object actually spans), and chosen pairs are de-duplicated.
+    target_iou is None -> targets are per-object IoU quantiles (so "high/mid/low"
+    adapt to whatever range the object actually spans). Otherwise the three
+    columns are centered on target_iou (target-0.1 / target / target+0.1, clamped
+    to [0, 1]) and labelled by those target IoUs. Chosen pairs are de-duplicated.
     Returns list of (level, name_a, name_b, iou).
     """
     names = sorted(images)
@@ -485,15 +489,22 @@ def pick_pairs_by_overlap(images, levels=("high", "mid", "low")):
     if not pairs:
         return []
     pairs.sort(reverse=True)
-    iou_vals = np.array([p[0] for p in pairs])
-    q = {"high": 0.97, "mid": 0.55, "low": 0.06}
+
+    if target_iou is not None:
+        # Three columns centered on the requested overlap.
+        targets = [(f"IoU~{t:.2f}", float(np.clip(t, 0.0, 1.0)))
+                   for t in (target_iou - 0.1, target_iou, target_iou + 0.1)]
+    else:
+        iou_vals = np.array([p[0] for p in pairs])
+        q = {"high": 0.97, "mid": 0.55, "low": 0.06}
+        targets = [(lvl, float(np.quantile(iou_vals, q[lvl]))) for lvl in levels]
+
     chosen, used = [], set()
-    for lvl in levels:
-        target = float(np.quantile(iou_vals, q[lvl]))
+    for label, target in targets:
         order = sorted(pairs, key=lambda p: abs(p[0] - target))
         pick = next((p for p in order if (p[1], p[2]) not in used), order[0])
         used.add((pick[1], pick[2]))
-        chosen.append((lvl, pick[1], pick[2], pick[0]))
+        chosen.append((label, pick[1], pick[2], pick[0]))
     return chosen
 
 
@@ -538,15 +549,19 @@ def _draw_cell(ax, object_dir, img_a, img_b, name_a, name_b, level, iou):
     ax.set_title(f"{level}  IoU={iou:.2f}", fontsize=10)
 
 
-def make_class_figure(cat, objdir, images, out_path, levels=("high", "mid", "low")):
-    """One figure for a single class: high -> mid -> low overlap columns."""
+def make_class_figure(cat, objdir, images, out_path, levels=("high", "mid", "low"),
+                      target_iou=None):
+    """One figure for a single class: high -> mid -> low overlap columns.
+
+    If target_iou is set, the three columns are centered on it instead.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
-    chosen = pick_pairs_by_overlap(images, levels)
+    chosen = pick_pairs_by_overlap(images, levels, target_iou)
     ncols = len(chosen)
     fig, axes = plt.subplots(1, ncols, figsize=(3.4 * ncols, 6.2), squeeze=False)
     for c, (level, na, nb, iou) in enumerate(chosen):
@@ -560,9 +575,11 @@ def make_class_figure(cat, objdir, images, out_path, levels=("high", "mid", "low
         Line2D([0], [0], marker="o", color="w", markerfacecolor=ONLY_B,
                markersize=9, label="only bottom frame"),
     ]
+    col_desc = (f"columns centered on IoU~{target_iou:.2f}"
+                if target_iou is not None else "columns = wider camera baseline")
     fig.suptitle(
         f"MVImgNet2 view overlap  —  class {cat}\n"
-        "columns = wider camera baseline;  "
+        f"{col_desc};  "
         "green = 3D points co-visible in both frames (overlap from COLMAP tracks)",
         fontsize=13, y=1.06,
     )
@@ -583,7 +600,7 @@ def run_classes(args):
         if args.mask is not False:  # None (auto) or True -> filter when masks exist
             filter_to_object(images, objdir)
         out_path = os.path.join(args.out_dir, f"overlap_class_{cat}.png")
-        make_class_figure(cat, objdir, images, out_path)
+        make_class_figure(cat, objdir, images, out_path, target_iou=args.target_iou)
         print(f"class {cat}: {objdir}  [{len(images)} imgs]  ->  {out_path}")
     print(f"wrote {len(objects)} figures to {args.out_dir}")
 
