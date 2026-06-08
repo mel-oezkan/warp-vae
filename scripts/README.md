@@ -23,5 +23,8 @@ e.g. `from warps.precompute_depth_warps import load_annotations`.
 
 - Keep source scripts (`.py`, `.sh`) under the topic folders above.
 - Do not keep generated artifacts (images, CSVs) here; scripts write them to `outputs/scripts/`.
+  Default the output path to a repo-root-relative `outputs/scripts/<name>/` (resolve the
+  repo root from `__file__`, not the cwd) so figures land there regardless of where the
+  script is launched from. See `visualization/plot_mvi2_overlap.py` for the pattern.
 - Use `./move_script_artifacts.sh` to move stray `.png` / `.csv` files from `scripts/` to `outputs/scripts/`.
 - Compiled caches and artifacts are ignored via `.gitignore` in this folder.
